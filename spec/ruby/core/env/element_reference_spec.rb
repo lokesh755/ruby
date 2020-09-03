@@ -16,7 +16,18 @@ describe "ENV.[]" do
 
   it "returns only frozen values" do
     ENV[@variable] = "a non-frozen string"
-    ENV[@variable].frozen?.should == true
+    ENV[@variable].should.frozen?
+  end
+
+  it "coerces a non-string name with #to_str" do
+    ENV[@variable] = "bar"
+    k = mock('key')
+    k.should_receive(:to_str).and_return(@variable)
+    ENV[k].should == "bar"
+  end
+
+  it "raises TypeError if the argument is not a String and does not respond to #to_str" do
+    -> { ENV[Object.new] }.should raise_error(TypeError, "no implicit conversion of Object into String")
   end
 
   platform_is :windows do

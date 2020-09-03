@@ -587,7 +587,7 @@ Init_native_thread(rb_thread_t *th)
         if (r) condattr_monotonic = NULL;
     }
 #endif
-    pthread_key_create(&ruby_native_thread_key, NULL);
+    pthread_key_create(&ruby_native_thread_key, 0);
     th->thread_id = pthread_self();
     fill_thread_id_str(th);
     native_thread_init(th);
@@ -950,7 +950,7 @@ static void *
 thread_start_func_1(void *th_ptr)
 {
     rb_thread_t *th = th_ptr;
-    RB_ALTSTACK_INIT(void *altstack);
+    RB_ALTSTACK_INIT(void *altstack, th->altstack);
 #if USE_THREAD_CACHE
   thread_start:
 #endif
@@ -1099,6 +1099,9 @@ native_thread_create(rb_thread_t *th)
         const size_t stack_size = th->vm->default_params.thread_machine_stack_size + th->vm->default_params.thread_vm_stack_size;
 	const size_t space = space_size(stack_size);
 
+#ifdef USE_SIGALTSTACK
+        th->altstack = rb_allocate_sigaltstack();
+#endif
         th->ec->machine.stack_maxsize = stack_size - space;
 
 	CHECK_ERR(pthread_attr_init(&attr));
@@ -1569,6 +1572,18 @@ setup_communication_pipe_internal(int pipes[2])
 # define SET_CURRENT_THREAD_NAME(name) prctl(PR_SET_NAME, name)
 #endif
 
+enum {
+    THREAD_NAME_MAX =
+#if defined(__linux__)
+    16
+#elif defined(__APPLE__)
+/* Undocumented, and main thread seems unlimited */
+    64
+#else
+    16
+#endif
+};
+
 static VALUE threadptr_invoke_proc_location(rb_thread_t *th);
 
 static void
@@ -1581,14 +1596,14 @@ native_set_thread_name(rb_thread_t *th)
     }
     else if ((loc = threadptr_invoke_proc_location(th)) != Qnil) {
         char *name, *p;
-        char buf[16];
+        char buf[THREAD_NAME_MAX];
         size_t len;
         int n;
 
         name = RSTRING_PTR(RARRAY_AREF(loc, 0));
         p = strrchr(name, '/'); /* show only the basename of the path. */
         if (p && p[1])
-          name = p + 1;
+            name = p + 1;
 
         n = snprintf(buf, sizeof(buf), "%s:%d", name, NUM2INT(RARRAY_AREF(loc, 1)));
         rb_gc_force_recycle(loc); /* acts as a GC guard, too */
@@ -1603,15 +1618,30 @@ native_set_thread_name(rb_thread_t *th)
 #endif
 }
 
-static VALUE
+static void
 native_set_another_thread_name(rb_nativethread_id_t thread_id, VALUE name)
 {
-#ifdef SET_ANOTHER_THREAD_NAME
+#if defined SET_ANOTHER_THREAD_NAME || defined SET_CURRENT_THREAD_NAME
+    char buf[THREAD_NAME_MAX];
     const char *s = "";
-    if (!NIL_P(name)) s = RSTRING_PTR(name);
+# if !defined SET_ANOTHER_THREAD_NAME
+    if (!pthread_equal(pthread_self(), thread_id)) return;
+# endif
+    if (!NIL_P(name)) {
+        long n;
+        RSTRING_GETMEM(name, s, n);
+        if (n >= (int)sizeof(buf)) {
+            memcpy(buf, s, sizeof(buf)-1);
+            buf[sizeof(buf)-1] = '\0';
+            s = buf;
+        }
+    }
+# if defined SET_ANOTHER_THREAD_NAME
     SET_ANOTHER_THREAD_NAME(thread_id, s);
+# elif defined SET_CURRENT_THREAD_NAME
+    SET_CURRENT_THREAD_NAME(s);
+# endif
 #endif
-    return name;
 }
 
 static void
@@ -2156,7 +2186,7 @@ timer_pthread_fn(void *p)
 #endif /* UBF_TIMER_PTHREAD */
 
 static VALUE
-ubf_caller(const void *ignore)
+ubf_caller(void *ignore)
 {
     rb_thread_sleep_forever();
 

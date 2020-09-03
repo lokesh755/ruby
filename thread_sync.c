@@ -78,7 +78,7 @@ static const char* rb_mutex_unlock_th(rb_mutex_t *mutex, rb_thread_t *th);
  *
  */
 
-#define mutex_mark NULL
+#define mutex_mark ((void(*)(void*))0)
 
 static size_t
 rb_mutex_num_waiting(rb_mutex_t *mutex)
@@ -190,6 +190,8 @@ mutex_locked(rb_thread_t *th, VALUE self)
 	mutex->next_mutex = th->keeping_mutexes;
     }
     th->keeping_mutexes = mutex;
+
+    th->blocking += 1;
 }
 
 /*
@@ -222,6 +224,17 @@ rb_mutex_trylock(VALUE self)
  * introduces new race conditions. [Bug #6278] [ruby-core:44275]
  */
 static const rb_thread_t *patrol_thread = NULL;
+
+static VALUE
+mutex_owned_p(rb_thread_t *th, rb_mutex_t *mutex)
+{
+    if (mutex->th == th) {
+        return Qtrue;
+    }
+    else {
+        return Qfalse;
+    }
+}
 
 static VALUE
 do_mutex_lock(VALUE self, int interruptible_p)
@@ -292,11 +305,16 @@ do_mutex_lock(VALUE self, int interruptible_p)
                     mutex->th = th;
                     mutex_locked(th, self);
                 }
-            } else {
+            }
+            else {
                 if (mutex->th == th) mutex_locked(th, self);
             }
 	}
     }
+
+    // assertion
+    if (mutex_owned_p(th, mutex) == Qfalse) rb_bug("do_mutex_lock: mutex is not owned.");
+
     return self;
 }
 
@@ -328,14 +346,10 @@ rb_mutex_lock(VALUE self)
 VALUE
 rb_mutex_owned_p(VALUE self)
 {
-    VALUE owned = Qfalse;
     rb_thread_t *th = GET_THREAD();
     rb_mutex_t *mutex = mutex_ptr(self);
 
-    if (mutex->th == th)
-	owned = Qtrue;
-
-    return owned;
+    return mutex_owned_p(th, mutex);
 }
 
 static const char *
@@ -352,6 +366,8 @@ rb_mutex_unlock_th(rb_mutex_t *mutex, rb_thread_t *th)
     else {
 	struct sync_waiter *cur = 0, *next;
 	rb_mutex_t **th_mutex = &th->keeping_mutexes;
+
+        th->blocking -= 1;
 
 	mutex->th = 0;
 	list_for_each_safe(&mutex->waitq, cur, next, node) {
@@ -392,8 +408,9 @@ rb_mutex_unlock(VALUE self)
 {
     const char *err;
     rb_mutex_t *mutex = mutex_ptr(self);
+    rb_thread_t *th = GET_THREAD();
 
-    err = rb_mutex_unlock_th(mutex, GET_THREAD());
+    err = rb_mutex_unlock_th(mutex, th);
     if (err) rb_raise(rb_eThreadError, "%s", err);
 
     return self;
@@ -521,7 +538,7 @@ rb_mutex_synchronize(VALUE mutex, VALUE (*func)(VALUE arg), VALUE arg)
  * completes.  See the example under +Mutex+.
  */
 static VALUE
-rb_mutex_synchronize_m(VALUE self, VALUE args)
+rb_mutex_synchronize_m(VALUE self)
 {
     if (!rb_block_given_p()) {
 	rb_raise(rb_eThreadError, "must be called with a block");
@@ -1139,7 +1156,7 @@ rb_szqueue_push(int argc, VALUE *argv, VALUE self)
 	    rb_raise(rb_eThreadError, "queue full");
 	}
 	else if (queue_closed_p(self)) {
-	    goto closed;
+            break;
 	}
 	else {
 	    struct queue_waiter qw;
@@ -1155,7 +1172,6 @@ rb_szqueue_push(int argc, VALUE *argv, VALUE self)
     }
 
     if (queue_closed_p(self)) {
-      closed:
 	raise_closed_queue_error(self);
     }
 
@@ -1363,8 +1379,9 @@ do_sleep(VALUE args)
 }
 
 static VALUE
-delete_from_waitq(struct sync_waiter *w)
+delete_from_waitq(VALUE v)
 {
+    struct sync_waiter *w = (void *)v;
     list_del(&w->node);
 
     return Qnil;
@@ -1424,6 +1441,7 @@ rb_condvar_broadcast(VALUE self)
     return self;
 }
 
+NORETURN(static VALUE undumpable(VALUE obj));
 /* :nodoc: */
 static VALUE
 undumpable(VALUE obj)

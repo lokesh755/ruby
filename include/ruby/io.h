@@ -1,27 +1,16 @@
-/**********************************************************************
-
-  rubyio.h -
-
-  $Author$
-  created at: Fri Nov 12 16:47:09 JST 1993
-
-  Copyright (C) 1993-2007 Yukihiro Matsumoto
-
-**********************************************************************/
-
-#ifndef RUBY_IO_H
+#ifndef RUBY_IO_H                                    /*-*-C++-*-vi:se ft=cpp:*/
 #define RUBY_IO_H 1
-
-#ifdef RUBY_INTERNAL_H
-#error "Include this file before internal.h"
-#endif
-
-#if defined(__cplusplus)
-extern "C" {
-#if 0
-} /* satisfy cc-mode */
-#endif
-#endif
+/**
+ * @file
+ * @author     $Author$
+ * @date       Fri Nov 12 16:47:09 JST 1993
+ * @copyright  Copyright (C) 1993-2007 Yukihiro Matsumoto
+ * @copyright  This  file  is   a  part  of  the   programming  language  Ruby.
+ *             Permission  is hereby  granted,  to  either redistribute  and/or
+ *             modify this file, provided that  the conditions mentioned in the
+ *             file COPYING are met.  Consult the file for details.
+ */
+#include "ruby/internal/config.h"
 
 #include <stdio.h>
 #include "ruby/encoding.h"
@@ -30,7 +19,6 @@ extern "C" {
 #include <stdio_ext.h>
 #endif
 
-#include "ruby/config.h"
 #include <errno.h>
 #if defined(HAVE_POLL)
 #  ifdef _AIX
@@ -53,7 +41,8 @@ extern "C" {
 #  define RB_WAITFD_OUT 0x004
 #endif
 
-RUBY_SYMBOL_EXPORT_BEGIN
+#include "ruby/internal/dllexport.h"
+RBIMPL_SYMBOL_EXPORT_BEGIN()
 
 PACKED_STRUCT_UNALIGNED(struct rb_io_buffer_t {
     char *ptr;                  /* off + len <= capa */
@@ -100,6 +89,8 @@ typedef struct rb_io_t {
 
     VALUE write_lock;
 } rb_io_t;
+
+typedef struct rb_io_enc_t rb_io_enc_t;
 
 #define HAVE_RB_IO_T 1
 
@@ -153,6 +144,7 @@ int rb_io_wait_writable(int);
 int rb_wait_for_single_fd(int fd, int events, struct timeval *tv);
 void rb_io_set_nonblock(rb_io_t *fptr);
 int rb_io_extract_encoding_option(VALUE opt, rb_encoding **enc_p, rb_encoding **enc2_p, int *fmode_p);
+void rb_io_extract_modeenc(VALUE *vmode_p, VALUE *vperm_p, VALUE opthash, int *oflags_p, int *fmode_p, rb_io_enc_t *convconfig_p);
 ssize_t rb_io_bufwrite(VALUE io, const void *buf, size_t size);
 
 /* compatibility for ruby 1.8 and older */
@@ -170,13 +162,6 @@ VALUE rb_stat_new(const struct stat *);
 
 /* gc.c */
 
-RUBY_SYMBOL_EXPORT_END
-
-#if defined(__cplusplus)
-#if 0
-{ /* satisfy cc-mode */
-#endif
-}  /* extern "C" { */
-#endif
+RBIMPL_SYMBOL_EXPORT_END()
 
 #endif /* RUBY_IO_H */

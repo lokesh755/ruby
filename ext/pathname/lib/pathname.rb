@@ -207,7 +207,7 @@ class Pathname
   # pathnames which points to roots such as <tt>/usr/..</tt>.
   #
   def root?
-    !!(chop_basename(@path) == nil && /#{SEPARATOR_PAT}/o.match?(@path))
+    chop_basename(@path) == nil && /#{SEPARATOR_PAT}/o.match?(@path)
   end
 
   # Predicate method for testing whether a path is absolute.
@@ -501,6 +501,9 @@ class Pathname
   # This method doesn't access the filesystem.  It assumes no symlinks.
   #
   # ArgumentError is raised when it cannot find a relative path.
+  #
+  # Note that this method does not handle situations where the case sensitivity
+  # of the filesystem in use differs from the operating system default.
   #
   def relative_path_from(base_directory)
     base_directory = Pathname.new(base_directory) unless base_directory.is_a? Pathname

@@ -1,8 +1,10 @@
 [![Build Status](https://travis-ci.org/ruby/ruby.svg?branch=master)](https://travis-ci.org/ruby/ruby)
-[![wercker status](https://app.wercker.com/status/e5e7e1704f62b76525022aa424aef6ef/s/master "wercker status")](https://app.wercker.com/project/byKey/e5e7e1704f62b76525022aa424aef6ef)
 [![Build status](https://ci.appveyor.com/api/projects/status/0sy8rrxut4o0k960/branch/master?svg=true)](https://ci.appveyor.com/project/ruby/ruby/branch/master)
-[![Build Status](https://dev.azure.com/rubylang/ruby/_apis/build/status/ruby.ruby?branchName=master)](https://dev.azure.com/rubylang/ruby/_build/latest?definitionId=3&branchName=master)
-
+[![Actions Status](https://github.com/ruby/ruby/workflows/macOS/badge.svg)](https://github.com/ruby/ruby/actions?query=workflow%3A"macOS")
+[![Actions Status](https://github.com/ruby/ruby/workflows/MinGW/badge.svg)](https://github.com/ruby/ruby/actions?query=workflow%3A"MinGW")
+[![Actions Status](https://github.com/ruby/ruby/workflows/MJIT/badge.svg)](https://github.com/ruby/ruby/actions?query=workflow%3A"MJIT")
+[![Actions Status](https://github.com/ruby/ruby/workflows/Ubuntu/badge.svg)](https://github.com/ruby/ruby/actions?query=workflow%3A"Ubuntu")
+[![Actions Status](https://github.com/ruby/ruby/workflows/Windows/badge.svg)](https://github.com/ruby/ruby/actions?query=workflow%3A"Windows")
 
 # Rubyとは
 
@@ -100,7 +102,7 @@ Ruby拡張モジュールについて話し合うruby-extメーリングリス�
     環境によってはデフォルトのCコンパイラ用オプションが付きます． `configure` オプションで `optflags=..`
     `warnflags=..` 等で上書きできます．
 
-3.  (必要ならば)`defines.h` を編集する
+3.  (必要ならば)`include/ruby/defines.h` を編集する
 
     多分，必要無いと思います．
 

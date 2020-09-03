@@ -405,6 +405,19 @@ class TestIO < Test::Unit::TestCase
     }
   end
 
+  def test_each_codepoint_enumerator
+    make_tempfile {|t|
+      a = ""
+      b = ""
+      File.open(t, 'rt') {|f|
+        a = f.each_codepoint.take(4).pack('U*')
+        b = f.read(8)
+      }
+      assert_equal("foo\n", a)
+      assert_equal("bar\nbaz\n", b)
+    }
+  end
+
   def test_codepoints
     make_tempfile {|t|
       bug2959 = '[ruby-core:28650]'
@@ -423,7 +436,7 @@ class TestIO < Test::Unit::TestCase
     path = t.path
     t.close!
     assert_raise(Errno::ENOENT, "[ruby-dev:33072]") do
-      File.read(path, nil, nil, {})
+      File.read(path, nil, nil, **{})
     end
   end
 
@@ -1395,7 +1408,7 @@ class TestIO < Test::Unit::TestCase
   def test_dup_many
     opts = {}
     opts[:rlimit_nofile] = 1024 if defined?(Process::RLIMIT_NOFILE)
-    assert_separately([], <<-'End', opts)
+    assert_separately([], <<-'End', **opts)
       a = []
       assert_raise(Errno::EMFILE, Errno::ENFILE, Errno::ENOMEM) do
         loop {a << IO.pipe}
@@ -2279,6 +2292,21 @@ class TestIO < Test::Unit::TestCase
     assert_equal(o, o2)
   end
 
+  def test_open_redirect_keyword
+    o = Object.new
+    def o.to_open(**kw); kw; end
+    assert_equal({:a=>1}, open(o, a: 1))
+
+    assert_raise(ArgumentError) { open(o, {a: 1}) }
+
+    class << o
+      remove_method(:to_open)
+    end
+    def o.to_open(kw); kw; end
+    assert_equal({:a=>1}, open(o, a: 1))
+    assert_equal({:a=>1}, open(o, {a: 1}))
+  end
+
   def test_open_pipe
     open("|" + EnvUtil.rubybin, "r+") do |f|
       f.puts "puts 'foo'"
@@ -2474,6 +2502,17 @@ class TestIO < Test::Unit::TestCase
     end
   end
 
+  def test_reopen_ivar
+    assert_ruby_status([], "#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+      f = File.open(IO::NULL)
+      f.instance_variable_set(:@foo, 42)
+      f.reopen(STDIN)
+      f.instance_variable_defined?(:@foo)
+      f.instance_variable_get(:@foo)
+    end;
+  end
+
   def test_foreach
     a = []
     IO.foreach("|" + EnvUtil.rubybin + " -e 'puts :foo; puts :bar; puts :baz'") {|x| a << x }
@@ -2489,15 +2528,15 @@ class TestIO < Test::Unit::TestCase
       assert_equal(["foo\n", "bar\n", "baz\n"], a)
 
       a = []
-      IO.foreach(t.path, {:mode => "r" }) {|x| a << x }
+      IO.foreach(t.path, :mode => "r") {|x| a << x }
       assert_equal(["foo\n", "bar\n", "baz\n"], a)
 
       a = []
-      IO.foreach(t.path, {:open_args => [] }) {|x| a << x }
+      IO.foreach(t.path, :open_args => []) {|x| a << x }
       assert_equal(["foo\n", "bar\n", "baz\n"], a)
 
       a = []
-      IO.foreach(t.path, {:open_args => ["r"] }) {|x| a << x }
+      IO.foreach(t.path, :open_args => ["r"]) {|x| a << x }
       assert_equal(["foo\n", "bar\n", "baz\n"], a)
 
       a = []
@@ -2553,11 +2592,13 @@ class TestIO < Test::Unit::TestCase
   end
 
   def test_print_separators
-    EnvUtil.suppress_warning {$, = ':'}
-    $\ = "\n"
+    EnvUtil.suppress_warning {
+      $, = ':'
+      $\ = "\n"
+    }
     pipe(proc do |w|
       w.print('a')
-      w.print('a','b','c')
+      EnvUtil.suppress_warning {w.print('a','b','c')}
       w.close
     end, proc do |r|
       assert_equal("a\n", r.gets)
@@ -2741,13 +2782,6 @@ class TestIO < Test::Unit::TestCase
     }
   end if /freebsd|linux/ =~ RUBY_PLATFORM and defined? File::NOFOLLOW
 
-  def test_tainted
-    make_tempfile {|t|
-      assert_predicate(File.read(t.path, 4), :tainted?, '[ruby-dev:38826]')
-      assert_predicate(File.open(t.path) {|f| f.read(4)}, :tainted?, '[ruby-dev:38826]')
-    }
-  end
-
   def test_binmode_after_closed
     make_tempfile {|t|
       assert_raise(IOError) {t.binmode}
@@ -2780,7 +2814,7 @@ __END__
 
   def test_flush_in_finalizer1
     bug3910 = '[ruby-dev:42341]'
-    tmp = Tempfile.open("bug3910") {|t|
+    Tempfile.open("bug3910") {|t|
       path = t.path
       t.close
       fds = []
@@ -2792,7 +2826,6 @@ __END__
           f.print "hoge"
         }
       end
-      t
     }
   ensure
     ObjectSpace.each_object(File) {|f|
@@ -2800,7 +2833,6 @@ __END__
         f.close
       end
     }
-    tmp.close!
   end
 
   def test_flush_in_finalizer2
@@ -2824,7 +2856,6 @@ __END__
           end
         }
       end
-      t.close!
     }
   end
 
@@ -3118,9 +3149,8 @@ __END__
       assert_equal("\00f", File.read(path))
       assert_equal(1, File.write(path, "f", 0, encoding: "UTF-8"))
       assert_equal("ff", File.read(path))
-      assert_raise(TypeError) {
-        File.write(path, "foo", Object.new => Object.new)
-      }
+      File.write(path, "foo", Object.new => Object.new)
+      assert_equal("foo", File.read(path))
     end
   end
 
@@ -3621,15 +3651,27 @@ __END__
   end
 
   def test_open_flag_binary
+    binary_enc = Encoding.find("BINARY")
     make_tempfile do |t|
       open(t.path, File::RDONLY, flags: File::BINARY) do |f|
         assert_equal true, f.binmode?
+        assert_equal binary_enc, f.external_encoding
       end
       open(t.path, 'r', flags: File::BINARY) do |f|
         assert_equal true, f.binmode?
+        assert_equal binary_enc, f.external_encoding
       end
       open(t.path, mode: 'r', flags: File::BINARY) do |f|
         assert_equal true, f.binmode?
+        assert_equal binary_enc, f.external_encoding
+      end
+      open(t.path, File::RDONLY|File::BINARY) do |f|
+        assert_equal true, f.binmode?
+        assert_equal binary_enc, f.external_encoding
+      end
+      open(t.path, File::RDONLY|File::BINARY, autoclose: true) do |f|
+        assert_equal true, f.binmode?
+        assert_equal binary_enc, f.external_encoding
       end
     end
   end if File::BINARY != 0
@@ -3644,7 +3686,7 @@ __END__
 
   def test_race_gets_and_close
     opt = { signal: :ABRT, timeout: 200 }
-    assert_separately([], "#{<<-"begin;"}\n#{<<-"end;"}", opt)
+    assert_separately([], "#{<<-"begin;"}\n#{<<-"end;"}", **opt)
     bug13076 = '[ruby-core:78845] [Bug #13076]'
     begin;
       10.times do |i|
@@ -3813,38 +3855,40 @@ __END__
         end
       end
     end
-
-    def test_pread
-      make_tempfile { |t|
-        open(t.path) do |f|
-          assert_equal("bar", f.pread(3, 4))
-          buf = "asdf"
-          assert_equal("bar", f.pread(3, 4, buf))
-          assert_equal("bar", buf)
-          assert_raise(EOFError) { f.pread(1, f.size) }
-        end
-      }
-    end if IO.method_defined?(:pread)
-
-    def test_pwrite
-      make_tempfile { |t|
-        open(t.path, IO::RDWR) do |f|
-          assert_equal(3, f.pwrite("ooo", 4))
-          assert_equal("ooo", f.pread(3, 4))
-        end
-      }
-    end if IO.method_defined?(:pread) and IO.method_defined?(:pwrite)
   end
 
+  def test_pread
+    make_tempfile { |t|
+      open(t.path) do |f|
+        assert_equal("bar", f.pread(3, 4))
+        buf = "asdf"
+        assert_equal("bar", f.pread(3, 4, buf))
+        assert_equal("bar", buf)
+        assert_raise(EOFError) { f.pread(1, f.size) }
+      end
+    }
+  end if IO.method_defined?(:pread)
+
+  def test_pwrite
+    make_tempfile { |t|
+      open(t.path, IO::RDWR) do |f|
+        assert_equal(3, f.pwrite("ooo", 4))
+        assert_equal("ooo", f.pread(3, 4))
+      end
+    }
+  end if IO.method_defined?(:pread) and IO.method_defined?(:pwrite)
+
   def test_select_exceptfds
-    if Etc.uname[:sysname] == 'SunOS' && Etc.uname[:release] == '5.11'
-      skip "Solaris 11 fails this"
+    if Etc.uname[:sysname] == 'SunOS'
+      str = 'h'.freeze #(???) Only 1 byte with MSG_OOB on Solaris
+    else
+      str = 'hello'.freeze
     end
 
     TCPServer.open('localhost', 0) do |svr|
       con = TCPSocket.new('localhost', svr.addr[1])
       acc = svr.accept
-      assert_equal 5, con.send('hello', Socket::MSG_OOB)
+      assert_equal str.length, con.send(str, Socket::MSG_OOB)
       set = IO.select(nil, nil, [acc], 30)
       assert_equal([[], [], [acc]], set, 'IO#select exceptions array OK')
       acc.close
@@ -3890,21 +3934,22 @@ __END__
     end
   end
 
-  def test_select_leak
+  def test_select_memory_leak
     # avoid malloc arena explosion from glibc and jemalloc:
     env = {
       'MALLOC_ARENA_MAX' => '1',
       'MALLOC_ARENA_TEST' => '1',
       'MALLOC_CONF' => 'narenas:1',
     }
-    assert_no_memory_leak([env], <<-"end;", <<-"end;", rss: true, timeout: 60)
+    assert_no_memory_leak([env], "#{<<~"begin;"}\n#{<<~'else;'}", "#{<<~'end;'}", rss: true, timeout: 60)
+    begin;
       r, w = IO.pipe
       rset = [r]
       wset = [w]
       exc = StandardError.new(-"select used to leak on exception")
       exc.set_backtrace([])
       Thread.new { IO.select(rset, wset, nil, 0) }.join
-    end;
+    else;
       th = Thread.new do
         Thread.handle_interrupt(StandardError => :on_blocking) do
           begin
@@ -3928,5 +3973,23 @@ __END__
       assert_raise(TypeError) {Marshal.dump(r)}
       assert_raise(TypeError) {Marshal.dump(w)}
     }
+  end
+
+  def test_stdout_to_closed_pipe
+    EnvUtil.invoke_ruby(["-e", "loop {puts :ok}"], "", true, true) do
+      |in_p, out_p, err_p, pid|
+      out = out_p.gets
+      out_p.close
+      err = err_p.read
+    ensure
+      status = Process.wait2(pid)[1]
+      assert_equal("ok\n", out)
+      assert_empty(err)
+      assert_not_predicate(status, :success?)
+      if Signal.list["PIPE"]
+        assert_predicate(status, :signaled?)
+        assert_equal("PIPE", Signal.signame(status.termsig) || status.termsig)
+      end
+    end
   end
 end

@@ -51,7 +51,7 @@ class Downloader
   class GNU < self
     def self.download(name, *rest)
       if https?
-        super("https://raw.githubusercontent.com/gcc-mirror/gcc/master/#{name}", name, *rest)
+        super("https://cdn.jsdelivr.net/gh/gcc-mirror/gcc@master/#{name}", name, *rest)
       else
         super("https://repo.or.cz/official-gcc.git/blob_plain/HEAD:/#{name}", name, *rest)
       end
@@ -71,7 +71,7 @@ class Downloader
 
   class Unicode < self
     INDEX = {}  # cache index file information across files in the same directory
-    UNICODE_PUBLIC = "http://www.unicode.org/Public/"
+    UNICODE_PUBLIC = "https://www.unicode.org/Public/"
 
     def self.download(name, dir = nil, since = true, options = {})
       options = options.dup

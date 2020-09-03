@@ -131,10 +131,10 @@ class TestThreadQueue < Test::Unit::TestCase
   def test_thr_kill
     bug5343 = '[ruby-core:39634]'
     Dir.mktmpdir {|d|
-      timeout = 60
+      timeout = EnvUtil.apply_timeout_scale(60)
       total_count = 250
       begin
-        assert_normal_exit(<<-"_eom", bug5343, {:timeout => timeout, :chdir=>d})
+        assert_normal_exit(<<-"_eom", bug5343, **{:timeout => timeout, :chdir=>d})
           #{total_count}.times do |i|
             open("test_thr_kill_count", "w") {|f| f.puts i }
             queue = Queue.new
@@ -560,6 +560,10 @@ class TestThreadQueue < Test::Unit::TestCase
     if ENV['APPVEYOR'] == 'True' && RUBY_PLATFORM.match?(/mswin/)
       skip 'This test fails too often on AppVeyor vs140'
     end
+    if RUBY_PLATFORM.match?(/mingw/)
+      skip 'This test fails too often on MinGW'
+    end
+
     assert_in_out_err([], <<-INPUT, %w(INT INT exit), [])
       q = Queue.new
       trap(:INT){
@@ -568,6 +572,7 @@ class TestThreadQueue < Test::Unit::TestCase
       Thread.new{
         loop{
           Process.kill :INT, $$
+          sleep 0.1
         }
       }
       puts q.pop

@@ -8,8 +8,9 @@ class Reline::KeyActor::ViInsert::Test < Reline::TestCase
     @config.read_lines(<<~LINES.split(/(?<=\n)/))
       set editing-mode vi
     LINES
-    @line_editor = Reline::LineEditor.new(@config)
-    @line_editor.reset(@prompt, (RELINE_TEST_ENCODING rescue Encoding.default_external))
+    @encoding = (RELINE_TEST_ENCODING rescue Encoding.default_external)
+    @line_editor = Reline::LineEditor.new(@config, @encoding)
+    @line_editor.reset(@prompt, encoding: @encoding)
   end
 
   def test_vi_command_mode
@@ -21,6 +22,74 @@ class Reline::KeyActor::ViInsert::Test < Reline::TestCase
     input_keys("abc\C-[")
     assert_instance_of(Reline::KeyActor::ViCommand, @config.editing_mode)
     assert_line('abc')
+  end
+
+  def test_vi_insert
+    assert_instance_of(Reline::KeyActor::ViInsert, @config.editing_mode)
+    input_keys('i')
+    assert_line('i')
+    assert_cursor(1)
+    assert_instance_of(Reline::KeyActor::ViInsert, @config.editing_mode)
+    input_keys("\C-[")
+    assert_line('i')
+    assert_cursor(0)
+    assert_instance_of(Reline::KeyActor::ViCommand, @config.editing_mode)
+    input_keys('i')
+    assert_line('i')
+    assert_cursor(0)
+    assert_instance_of(Reline::KeyActor::ViInsert, @config.editing_mode)
+  end
+
+  def test_vi_add
+    assert_instance_of(Reline::KeyActor::ViInsert, @config.editing_mode)
+    input_keys('a')
+    assert_line('a')
+    assert_cursor(1)
+    assert_instance_of(Reline::KeyActor::ViInsert, @config.editing_mode)
+    input_keys("\C-[")
+    assert_line('a')
+    assert_cursor(0)
+    assert_instance_of(Reline::KeyActor::ViCommand, @config.editing_mode)
+    input_keys('a')
+    assert_line('a')
+    assert_cursor(1)
+    assert_instance_of(Reline::KeyActor::ViInsert, @config.editing_mode)
+  end
+
+  def test_vi_insert_at_bol
+    input_keys('I')
+    assert_line('I')
+    assert_instance_of(Reline::KeyActor::ViInsert, @config.editing_mode)
+    input_keys("12345\C-[hh")
+    assert_line('I12345')
+    assert_byte_pointer_size('I12')
+    assert_cursor(3)
+    assert_cursor_max(6)
+    assert_instance_of(Reline::KeyActor::ViCommand, @config.editing_mode)
+    input_keys('I')
+    assert_line('I12345')
+    assert_byte_pointer_size('')
+    assert_cursor(0)
+    assert_cursor_max(6)
+    assert_instance_of(Reline::KeyActor::ViInsert, @config.editing_mode)
+  end
+
+  def test_vi_add_at_eol
+    input_keys('A')
+    assert_line('A')
+    assert_instance_of(Reline::KeyActor::ViInsert, @config.editing_mode)
+    input_keys("12345\C-[hh")
+    assert_line('A12345')
+    assert_byte_pointer_size('A12')
+    assert_cursor(3)
+    assert_cursor_max(6)
+    assert_instance_of(Reline::KeyActor::ViCommand, @config.editing_mode)
+    input_keys('A')
+    assert_line('A12345')
+    assert_byte_pointer_size('A12345')
+    assert_cursor(6)
+    assert_cursor_max(6)
+    assert_instance_of(Reline::KeyActor::ViInsert, @config.editing_mode)
   end
 
   def test_ed_insert_one
@@ -564,6 +633,60 @@ class Reline::KeyActor::ViInsert::Test < Reline::TestCase
     assert_cursor_max(6)
   end
 
+  def test_vi_to_next_char
+    input_keys("abcdef\C-[0")
+    assert_line('abcdef')
+    assert_byte_pointer_size('')
+    assert_cursor(0)
+    assert_cursor_max(6)
+    input_keys('tz')
+    assert_line('abcdef')
+    assert_byte_pointer_size('')
+    assert_cursor(0)
+    assert_cursor_max(6)
+    input_keys('te')
+    assert_line('abcdef')
+    assert_byte_pointer_size('abc')
+    assert_cursor(3)
+    assert_cursor_max(6)
+  end
+
+  def test_vi_prev_char
+    input_keys("abcdef\C-[")
+    assert_line('abcdef')
+    assert_byte_pointer_size('abcde')
+    assert_cursor(5)
+    assert_cursor_max(6)
+    input_keys('Fz')
+    assert_line('abcdef')
+    assert_byte_pointer_size('abcde')
+    assert_cursor(5)
+    assert_cursor_max(6)
+    input_keys('Fa')
+    assert_line('abcdef')
+    assert_byte_pointer_size('')
+    assert_cursor(0)
+    assert_cursor_max(6)
+  end
+
+  def test_vi_to_prev_char
+    input_keys("abcdef\C-[")
+    assert_line('abcdef')
+    assert_byte_pointer_size('abcde')
+    assert_cursor(5)
+    assert_cursor_max(6)
+    input_keys('Tz')
+    assert_line('abcdef')
+    assert_byte_pointer_size('abcde')
+    assert_cursor(5)
+    assert_cursor_max(6)
+    input_keys('Ta')
+    assert_line('abcdef')
+    assert_byte_pointer_size('a')
+    assert_cursor(1)
+    assert_cursor_max(6)
+  end
+
   def test_vi_delete_next_char
     input_keys("abc\C-[h")
     assert_byte_pointer_size('a')
@@ -811,16 +934,19 @@ class Reline::KeyActor::ViInsert::Test < Reline::TestCase
   end
 
   def test_vi_list_or_eof
-    input_keys('a')
-    assert_byte_pointer_size('a')
-    assert_cursor(1)
-    assert_cursor_max(1)
+    input_keys("\C-d") # quit from inputing
+    assert_line(nil)
+    assert(@line_editor.finished?)
+  end
+
+  def test_vi_list_or_eof_with_non_empty_line
+    input_keys('ab')
+    assert_byte_pointer_size('ab')
+    assert_cursor(2)
+    assert_cursor_max(2)
     refute(@line_editor.finished?)
     input_keys("\C-d")
-    assert_line('a')
-    refute(@line_editor.finished?)
-    input_keys("\C-h\C-d")
-    assert_line(nil)
+    assert_line('ab')
     assert(@line_editor.finished?)
   end
 
@@ -829,6 +955,8 @@ class Reline::KeyActor::ViInsert::Test < Reline::TestCase
       %w{
         foo_bar
         foo_bar_baz
+      }.map { |i|
+        i.encode(@encoding)
       }
     }
     input_keys('foo')
@@ -883,6 +1011,8 @@ class Reline::KeyActor::ViInsert::Test < Reline::TestCase
       %w{
         foo_bar
         foo_bar_baz
+      }.map { |i|
+        i.encode(@encoding)
       }
     }
     input_keys('foo')
@@ -937,6 +1067,8 @@ class Reline::KeyActor::ViInsert::Test < Reline::TestCase
       %w{
         foo_bar
         foo_bar_baz
+      }.map { |i|
+        i.encode(@encoding)
       }
     }
     input_keys('abcde fo ABCDE')
@@ -986,6 +1118,49 @@ class Reline::KeyActor::ViInsert::Test < Reline::TestCase
     assert_cursor(17)
     assert_cursor_max(23)
     assert_line('abcde foo_bar_baz ABCDE')
+  end
+
+  def test_completion
+    @line_editor.completion_proc = proc { |word|
+      %w{
+        foo_bar
+        foo_bar_baz
+      }.map { |i|
+        i.encode(@encoding)
+      }
+    }
+    input_keys('foo')
+    assert_byte_pointer_size('foo')
+    assert_cursor(3)
+    assert_cursor_max(3)
+    assert_line('foo')
+    input_keys("\C-i")
+    assert_byte_pointer_size('foo_bar')
+    assert_cursor(7)
+    assert_cursor_max(7)
+    assert_line('foo_bar')
+  end
+
+  def test_completion_with_disable_completion
+    @config.disable_completion = true
+    @line_editor.completion_proc = proc { |word|
+      %w{
+        foo_bar
+        foo_bar_baz
+      }.map { |i|
+        i.encode(@encoding)
+      }
+    }
+    input_keys('foo')
+    assert_byte_pointer_size('foo')
+    assert_cursor(3)
+    assert_cursor_max(3)
+    assert_line('foo')
+    input_keys("\C-i")
+    assert_byte_pointer_size('foo')
+    assert_cursor(3)
+    assert_cursor_max(3)
+    assert_line('foo')
   end
 
   def test_vi_first_print
@@ -1038,5 +1213,28 @@ class Reline::KeyActor::ViInsert::Test < Reline::TestCase
     assert_cursor(4)
     assert_cursor_max(11)
     assert_line('aaa ddd eee')
+  end
+
+  def test_vi_change_meta
+    input_keys("aaa bbb ccc ddd eee\C-[02w")
+    assert_byte_pointer_size('aaa bbb ')
+    assert_cursor(8)
+    assert_cursor_max(19)
+    assert_line('aaa bbb ccc ddd eee')
+    input_keys('cwaiueo ')
+    assert_byte_pointer_size('aaa bbb aiueo ')
+    assert_cursor(14)
+    assert_cursor_max(21)
+    assert_line('aaa bbb aiueo ddd eee')
+    input_keys("\C-[")
+    assert_byte_pointer_size('aaa bbb aiueo')
+    assert_cursor(13)
+    assert_cursor_max(21)
+    assert_line('aaa bbb aiueo ddd eee')
+    input_keys('cb')
+    assert_byte_pointer_size('aaa bbb ')
+    assert_cursor(8)
+    assert_cursor_max(16)
+    assert_line('aaa bbb  ddd eee')
   end
 end

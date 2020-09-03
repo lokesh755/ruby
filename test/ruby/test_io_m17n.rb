@@ -23,7 +23,8 @@ class TestIO_M17N < Test::Unit::TestCase
 
   def pipe(*args, wp, rp)
     re, we = nil, nil
-    r, w = IO.pipe(*args)
+    kw = args.last.is_a?(Hash) ? args.pop : {}
+    r, w = IO.pipe(*args, **kw)
     rt = Thread.new do
       begin
         rp.call(r)
@@ -2046,19 +2047,19 @@ EOT
     with_tmpdir {
       open("raw.txt", "wb", xml: :attr) {|f| f.print '&<>"\''; f.puts "\u4E02\u3042" }
       content = File.read("raw.txt", :mode=>"rb:ascii-8bit")
-      assert_equal("\"&amp;&lt;&gt;&quot;'\u4E02\u3042\n\"".force_encoding("ascii-8bit"), content)
+      assert_equal("\"&amp;&lt;&gt;&quot;&apos;\u4E02\u3042\n\"".force_encoding("ascii-8bit"), content)
 
       open("ascii.txt", "wb:us-ascii", xml: :attr) {|f| f.print '&<>"\''; f.puts "\u4E02\u3042" }
       content = File.read("ascii.txt", :mode=>"rb:ascii-8bit")
-      assert_equal("\"&amp;&lt;&gt;&quot;'&#x4E02;&#x3042;\n\"".force_encoding("ascii-8bit"), content)
+      assert_equal("\"&amp;&lt;&gt;&quot;&apos;&#x4E02;&#x3042;\n\"".force_encoding("ascii-8bit"), content)
 
       open("iso-2022-jp.txt", "wb:iso-2022-jp", xml: :attr) {|f| f.print '&<>"\''; f.puts "\u4E02\u3042" }
       content = File.read("iso-2022-jp.txt", :mode=>"rb:ascii-8bit")
-      assert_equal("\"&amp;&lt;&gt;&quot;'&#x4E02;\e$B$\"\e(B\n\"".force_encoding("ascii-8bit"), content)
+      assert_equal("\"&amp;&lt;&gt;&quot;&apos;&#x4E02;\e$B$\"\e(B\n\"".force_encoding("ascii-8bit"), content)
 
       open("utf-16be.txt", "wb:utf-16be", xml: :attr) {|f| f.print '&<>"\''; f.puts "\u4E02\u3042" }
       content = File.read("utf-16be.txt", :mode=>"rb:ascii-8bit")
-      assert_equal("\0\"\0&\0a\0m\0p\0;\0&\0l\0t\0;\0&\0g\0t\0;\0&\0q\0u\0o\0t\0;\0'\x4E\x02\x30\x42\0\n\0\"".force_encoding("ascii-8bit"), content)
+      assert_equal("\0\"\0&\0a\0m\0p\0;\0&\0l\0t\0;\0&\0g\0t\0;\0&\0q\0u\0o\0t\0;\0&\0a\0p\0o\0s\0;\x4E\x02\x30\x42\0\n\0\"".force_encoding("ascii-8bit"), content)
 
       open("eucjp.txt", "w:euc-jp:utf-8", xml: :attr) {|f|
         f.print "\u4E02" # U+4E02 is 0x3021 in JIS X 0212
@@ -2084,8 +2085,8 @@ EOT
     define_method("test_strip_bom:#{name}") do
       path = "#{name}-bom.txt"
       with_tmpdir {
-        text = "\uFEFFa"
-        stripped = "a"
+        text = "\uFEFF\u0100a"
+        stripped = "\u0100a"
         content = text.encode(name)
         generate_file(path, content)
         result = File.read(path, mode: 'rb:BOM|UTF-8')
@@ -2101,6 +2102,9 @@ EOT
         File.open(path, "rb") {|f|
           assert_equal(Encoding.find(name), f.set_encoding_by_bom)
         }
+        File.open(path, "rb", encoding: "iso-8859-1") {|f|
+          assert_raise(ArgumentError) {f.set_encoding_by_bom}
+        }
       }
     end
   end
@@ -2113,6 +2117,10 @@ EOT
       bug3407 = '[ruby-core:30641]'
       result = File.read(path, encoding: 'BOM|UTF-8')
       assert_equal("a", result.b, bug3407)
+
+      File.open(path, "rb", encoding: "iso-8859-1") {|f|
+        assert_raise(ArgumentError) {f.set_encoding_by_bom}
+      }
     }
   end
 
@@ -2146,6 +2154,9 @@ EOT
 
       File.open(path, "rb") {|f|
         assert_nil(f.set_encoding_by_bom)
+      }
+      File.open(path, "rb", encoding: "iso-8859-1") {|f|
+        assert_raise(ArgumentError) {f.set_encoding_by_bom}
       }
     }
   end

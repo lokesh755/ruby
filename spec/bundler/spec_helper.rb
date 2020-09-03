@@ -1,11 +1,8 @@
 # frozen_string_literal: true
 
-$:.unshift File.expand_path("..", __FILE__)
-$:.unshift File.expand_path("../../lib", __FILE__)
-
 require "bundler/psyched_yaml"
 require "bundler/vendored_fileutils"
-require "uri"
+require "bundler/vendored_uri"
 require "digest"
 
 if File.expand_path(__FILE__) =~ %r{([^\w/\.:\-])}
@@ -13,16 +10,21 @@ if File.expand_path(__FILE__) =~ %r{([^\w/\.:\-])}
 end
 
 require "bundler"
-require "rspec"
+require "rspec/core"
+require "rspec/expectations"
+require "rspec/mocks"
 
-Dir["#{File.expand_path("../support", __FILE__)}/*.rb"].each do |file|
-  file = file.gsub(%r{\A#{Regexp.escape File.expand_path("..", __FILE__)}/}, "")
-  require file unless file.end_with?("hax.rb")
-end
+require_relative "support/builders"
+require_relative "support/filters"
+require_relative "support/helpers"
+require_relative "support/indexes"
+require_relative "support/matchers"
+require_relative "support/permissions"
+require_relative "support/platforms"
+require_relative "support/sometimes"
+require_relative "support/sudo"
 
 $debug = false
-
-Spec::Manpages.setup unless Gem.win_platform?
 
 module Gem
   def self.ruby=(ruby)
@@ -36,13 +38,14 @@ RSpec.configure do |config|
   config.include Spec::Indexes
   config.include Spec::Matchers
   config.include Spec::Path
-  config.include Spec::Rubygems
   config.include Spec::Platforms
   config.include Spec::Sudo
   config.include Spec::Permissions
 
   # Enable flags like --only-failures and --next-failure
   config.example_status_persistence_file_path = ".rspec_status"
+
+  config.silence_filter_announcements = !ENV["TEST_ENV_NUMBER"].nil?
 
   config.disable_monkey_patching!
 
@@ -54,32 +57,6 @@ RSpec.configure do |config|
 
   config.bisect_runner = :shell
 
-  if ENV["BUNDLER_SUDO_TESTS"] && Spec::Sudo.present?
-    config.filter_run :sudo => true
-  else
-    config.filter_run_excluding :sudo => true
-  end
-
-  if ENV["BUNDLER_REALWORLD_TESTS"]
-    config.filter_run :realworld => true
-  else
-    config.filter_run_excluding :realworld => true
-  end
-
-  git_version = Bundler::Source::Git::GitProxy.new(nil, nil, nil).version
-
-  config.filter_run_excluding :ruby => RequirementChecker.against(RUBY_VERSION)
-  config.filter_run_excluding :rubygems => RequirementChecker.against(Gem::VERSION)
-  config.filter_run_excluding :git => RequirementChecker.against(git_version)
-  config.filter_run_excluding :bundler => RequirementChecker.against(Bundler::VERSION.split(".")[0])
-  config.filter_run_excluding :ruby_repo => !(ENV["BUNDLE_RUBY"] && ENV["BUNDLE_GEM"]).nil?
-  config.filter_run_excluding :non_windows => Gem.win_platform?
-
-  config.filter_run_when_matching :focus unless ENV["CI"]
-
-  original_wd  = Dir.pwd
-  original_env = ENV.to_hash
-
   config.expect_with :rspec do |c|
     c.syntax = :expect
   end
@@ -89,17 +66,17 @@ RSpec.configure do |config|
   end
 
   config.around :each do |example|
-    if ENV["BUNDLE_RUBY"]
+    if ENV["RUBY"]
       orig_ruby = Gem.ruby
-      Gem.ruby = ENV["BUNDLE_RUBY"]
+      Gem.ruby = ENV["RUBY"]
     end
     example.run
-    Gem.ruby = orig_ruby if ENV["BUNDLE_RUBY"]
+    Gem.ruby = orig_ruby if ENV["RUBY"]
   end
 
   config.before :suite do
-    Spec::Rubygems.setup
-    ENV["RUBYOPT"] = "#{ENV["RUBYOPT"]} -r#{Spec::Path.spec_dir}/support/hax.rb"
+    require_relative "support/rubygems_ext"
+    Spec::Rubygems.test_setup
     ENV["BUNDLE_SPEC_RUN"] = "true"
     ENV["BUNDLE_USER_CONFIG"] = ENV["BUNDLE_USER_CACHE"] = ENV["BUNDLE_USER_PLUGIN"] = nil
     ENV["GEMRC"] = nil
@@ -107,41 +84,37 @@ RSpec.configure do |config|
     # Don't wrap output in tests
     ENV["THOR_COLUMNS"] = "10000"
 
-    original_env = ENV.to_hash
-
-    if ENV["BUNDLE_RUBY"]
-      FileUtils.cp_r Spec::Path.bindir, File.join(Spec::Path.root, "lib", "exe")
-    end
+    extend(Spec::Helpers)
+    system_gems :bundler, :path => pristine_system_gem_path
   end
 
   config.before :all do
     build_repo1
+
+    reset_paths!
   end
 
   config.around :each do |example|
-    ENV.replace(original_env)
-    reset!
-    system_gems []
-    in_app_root
-    @command_executions = []
+    begin
+      FileUtils.cp_r pristine_system_gem_path, system_gem_path
 
-    example.run
+      with_gem_path_as(system_gem_path) do
+        Bundler.ui.silence { example.run }
 
-    all_output = @command_executions.map(&:to_s_verbose).join("\n\n")
-    if example.exception && !all_output.empty?
-      warn all_output unless config.formatters.grep(RSpec::Core::Formatters::DocumentationFormatter).empty?
-      message = example.exception.message + "\n\nCommands:\n#{all_output}"
-      (class << example.exception; self; end).send(:define_method, :message) do
-        message
+        all_output = all_commands_output
+        if example.exception && !all_output.empty?
+          message = example.exception.message + all_output
+          (class << example.exception; self; end).send(:define_method, :message) do
+            message
+          end
+        end
       end
+    ensure
+      reset!
     end
-
-    Dir.chdir(original_wd)
   end
 
   config.after :suite do
-    if ENV["BUNDLE_RUBY"]
-      FileUtils.rm_rf File.join(Spec::Path.root, "lib", "exe")
-    end
+    FileUtils.rm_r Spec::Path.pristine_system_gem_path
   end
 end

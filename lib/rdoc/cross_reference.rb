@@ -19,7 +19,7 @@ class RDoc::CrossReference
   #
   # See CLASS_REGEXP_STR
 
-  METHOD_REGEXP_STR = '([a-z]\w*[!?=]?|%|===|\[\]=?|<<|>>|-|\+|\*)(?:\([\w.+*/=<>-]*\))?'
+  METHOD_REGEXP_STR = '([a-z]\w*[!?=]?|%|===|\[\]=?|<<|>>|\+@|-@|-|\+|\*)(?:\([\w.+*/=<>-]*\))?'
 
   ##
   # Regular expressions matching text that should potentially have
@@ -28,7 +28,7 @@ class RDoc::CrossReference
   # have been suppressed, since the suppression characters are removed by the
   # code that is triggered.
 
-  CROSSREF_REGEXP = /(?:^|\s)
+  CROSSREF_REGEXP = /(?:^|[\s()])
                      (
                       (?:
                        # A::B::C.meth
@@ -76,7 +76,7 @@ class RDoc::CrossReference
   # Version of CROSSREF_REGEXP used when <tt>--hyperlink-all</tt> is specified.
 
   ALL_CROSSREF_REGEXP = /
-                     (?:^|\s)
+                     (?:^|[\s()])
                      (
                       (?:
                        # A::B::C.meth

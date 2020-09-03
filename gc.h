@@ -1,11 +1,15 @@
-
 #ifndef RUBY_GC_H
 #define RUBY_GC_H 1
+#include "ruby/ruby.h"
 
 #if defined(__x86_64__) && !defined(_ILP32) && defined(__GNUC__)
 #define SET_MACHINE_STACK_END(p) __asm__ __volatile__ ("movq\t%%rsp, %0" : "=r" (*(p)))
 #elif defined(__i386) && defined(__GNUC__)
 #define SET_MACHINE_STACK_END(p) __asm__ __volatile__ ("movl\t%%esp, %0" : "=r" (*(p)))
+#elif defined(__powerpc64__) && defined(__GNUC__)
+#define SET_MACHINE_STACK_END(p) __asm__ __volatile__ ("mr\t%0, %%r1" : "=r" (*(p)))
+#elif defined(__aarch64__) && defined(__GNUC__)
+#define SET_MACHINE_STACK_END(p) __asm__ __volatile__ ("mov\t%0, sp" : "=r" (*(p)))
 #else
 NOINLINE(void rb_gc_set_stack_end(VALUE **stack_end_p));
 #define SET_MACHINE_STACK_END(p) rb_gc_set_stack_end(p)
@@ -57,9 +61,9 @@ rb_gc_debug_body(const char *mode, const char *msg, int st, void *ptr)
 #define RUBY_GC_INFO if(0)printf
 #endif
 
-#define RUBY_MARK_NO_PIN_UNLESS_NULL(ptr) do { \
+#define RUBY_MARK_MOVABLE_UNLESS_NULL(ptr) do { \
     VALUE markobj = (ptr); \
-    if (RTEST(markobj)) {rb_gc_mark_no_pin(markobj);} \
+    if (RTEST(markobj)) {rb_gc_mark_movable(markobj);} \
 } while (0)
 #define RUBY_MARK_UNLESS_NULL(ptr) do { \
     VALUE markobj = (ptr); \
@@ -100,7 +104,6 @@ int ruby_get_stack_grow_direction(volatile VALUE *addr);
 
 const char *rb_obj_info(VALUE obj);
 const char *rb_raw_obj_info(char *buff, const int buff_size, VALUE obj);
-void rb_obj_info_dump(VALUE obj);
 
 VALUE rb_gc_disable_no_rest(void);
 

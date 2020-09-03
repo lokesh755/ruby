@@ -81,6 +81,8 @@ class TestRange < Test::Unit::TestCase
     assert_equal(nil, (2..1).min)
     assert_equal(1, (1...2).min)
     assert_equal(1, (1..).min)
+    assert_raise(RangeError) { (..1).min }
+    assert_raise(RangeError) { (...1).min }
 
     assert_equal(1.0, (1.0..2.0).min)
     assert_equal(nil, (2.0..1.0).min)
@@ -93,6 +95,8 @@ class TestRange < Test::Unit::TestCase
     assert_equal([0,1,2], (0..10).min(3))
     assert_equal([0,1], (0..1).min(3))
     assert_equal([0,1,2], (0..).min(3))
+    assert_raise(RangeError) { (..1).min(3) }
+    assert_raise(RangeError) { (...1).min(3) }
 
     assert_raise(RangeError) { (0..).min {|a, b| a <=> b } }
   end
@@ -119,6 +123,42 @@ class TestRange < Test::Unit::TestCase
     assert_equal([9,8,7], (0...10).max(3))
     assert_raise(RangeError) { (1..).max(3) }
     assert_raise(RangeError) { (1...).max(3) }
+
+    assert_raise(RangeError) { (..0).min {|a, b| a <=> b } }
+
+    assert_equal(2, (..2).max)
+    assert_raise(TypeError) { (...2).max }
+    assert_raise(TypeError) { (...2.0).max }
+
+    assert_equal(Float::INFINITY, (1..Float::INFINITY).max)
+    assert_nil((1..-Float::INFINITY).max)
+  end
+
+  def test_minmax
+    assert_equal([1, 2], (1..2).minmax)
+    assert_equal([nil, nil], (2..1).minmax)
+    assert_equal([1, 1], (1...2).minmax)
+    assert_raise(RangeError) { (1..).minmax }
+    assert_raise(RangeError) { (1...).minmax }
+
+    assert_equal([1.0, 2.0], (1.0..2.0).minmax)
+    assert_equal([nil, nil], (2.0..1.0).minmax)
+    assert_raise(TypeError) { (1.0...2.0).minmax }
+    assert_raise(TypeError) { (1...1.5).minmax }
+    assert_raise(TypeError) { (1.5...2).minmax }
+
+    assert_equal([-0x80000002, -0x80000002], ((-0x80000002)...(-0x80000001)).minmax)
+
+    assert_equal([0, 0], (0..0).minmax)
+    assert_equal([nil, nil], (0...0).minmax)
+
+    assert_equal([2, 1], (1..2).minmax{|a, b| b <=> a})
+
+    assert_equal(['a', 'c'], ('a'..'c').minmax)
+    assert_equal(['a', 'b'], ('a'...'c').minmax)
+
+    assert_equal([1, Float::INFINITY], (1..Float::INFINITY).minmax)
+    assert_equal([nil, nil], (1..-Float::INFINITY).minmax)
   end
 
   def test_initialize_twice
@@ -230,6 +270,7 @@ class TestRange < Test::Unit::TestCase
     assert_kind_of(Enumerator::ArithmeticSequence, (..10).step(2))
     assert_kind_of(Enumerator::ArithmeticSequence, (1..).step(2))
 
+    assert_raise(ArgumentError) { (0..10).step(-1) { } }
     assert_raise(ArgumentError) { (0..10).step(0) { } }
     assert_raise(ArgumentError) { (0..).step(-1) { } }
     assert_raise(ArgumentError) { (0..).step(0) { } }
@@ -477,11 +518,6 @@ class TestRange < Test::Unit::TestCase
     assert_equal("0...1", (0...1).to_s)
     assert_equal("0..", (0..nil).to_s)
     assert_equal("0...", (0...nil).to_s)
-
-    bug11767 = '[ruby-core:71811] [Bug #11767]'
-    assert_predicate(("0".taint.."1").to_s, :tainted?, bug11767)
-    assert_predicate(("0".."1".taint).to_s, :tainted?, bug11767)
-    assert_predicate(("0".."1").taint.to_s, :tainted?, bug11767)
   end
 
   def test_inspect
@@ -493,11 +529,6 @@ class TestRange < Test::Unit::TestCase
     assert_equal("...1", (nil...1).inspect)
     assert_equal("nil..nil", (nil..nil).inspect)
     assert_equal("nil...nil", (nil...nil).inspect)
-
-    bug11767 = '[ruby-core:71811] [Bug #11767]'
-    assert_predicate(("0".taint.."1").inspect, :tainted?, bug11767)
-    assert_predicate(("0".."1".taint).inspect, :tainted?, bug11767)
-    assert_predicate(("0".."1").taint.inspect, :tainted?, bug11767)
   end
 
   def test_eqq
@@ -505,6 +536,14 @@ class TestRange < Test::Unit::TestCase
     assert_not_operator(0..10, :===, 11)
     assert_operator(5..nil, :===, 11)
     assert_not_operator(5..nil, :===, 0)
+  end
+
+  def test_eqq_string
+    assert_operator('A'..'Z', :===, 'ANA')
+    assert_not_operator('A'..'Z', :===, 'ana')
+    assert_operator('A'.., :===, 'ANA')
+    assert_operator(..'Z', :===, 'ANA')
+    assert_operator(nil..nil, :===, 'ANA')
   end
 
   def test_eqq_time
@@ -929,5 +968,9 @@ class TestRange < Test::Unit::TestCase
 
   def test_beginless_range_iteration
     assert_raise(TypeError) { (..1).each { } }
+  end
+
+  def test_count
+    assert_equal(Float::INFINITY, (1..).count)
   end
 end

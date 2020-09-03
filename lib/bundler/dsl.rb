@@ -44,7 +44,7 @@ module Bundler
       @gemfile = expanded_gemfile_path
       @gemfiles << expanded_gemfile_path
       contents ||= Bundler.read_file(@gemfile.to_s)
-      instance_eval(contents.dup.untaint, gemfile.to_s, 1)
+      instance_eval(contents.dup.tap{|x| x.untaint if RUBY_VERSION < "2.7" }, gemfile.to_s, 1)
     rescue Exception => e # rubocop:disable Lint/RescueException
       message = "There was an error " \
         "#{e.is_a?(GemfileEvalError) ? "evaluating" : "parsing"} " \
@@ -75,8 +75,7 @@ module Bundler
 
         @gemspecs << spec
 
-        gem_platforms = Bundler::Dependency::REVERSE_PLATFORM_MAP[Bundler::GemHelpers.generic_local_platform]
-        gem spec.name, :name => spec.name, :path => path, :glob => glob, :platforms => gem_platforms
+        gem spec.name, :name => spec.name, :path => path, :glob => glob
 
         group(development_group) do
           spec.development_dependencies.each do |dep|
@@ -128,7 +127,7 @@ module Bundler
         else
           Bundler.ui.warn "Your Gemfile lists the gem #{current.name} (#{current.requirement}) more than once.\n" \
                           "You should probably keep only one of them.\n" \
-                          "Remove any duplicate entries and specify the gem only once (per group).\n" \
+                          "Remove any duplicate entries and specify the gem only once.\n" \
                           "While it's not a problem now, it could cause errors if you change the version of one of them later."
         end
 
@@ -223,7 +222,6 @@ module Bundler
 
     def github(repo, options = {})
       raise ArgumentError, "GitHub sources require a block" unless block_given?
-      raise DeprecatedError, "The #github method has been removed" if Bundler.feature_flag.skip_default_git_sources?
       github_uri  = @git_sources["github"].call(repo)
       git_options = normalize_hash(options).merge("uri" => github_uri)
       git_source  = @sources.add_git_source(git_options)
@@ -284,8 +282,6 @@ module Bundler
   private
 
     def add_git_sources
-      return if Bundler.feature_flag.skip_default_git_sources?
-
       git_source(:github) do |repo_name|
         warn_deprecated_git_source(:github, <<-'RUBY'.strip, 'Change any "reponame" :github sources to "username/reponame".')
 "https://github.com/#{repo_name}.git"

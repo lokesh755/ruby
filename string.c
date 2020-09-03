@@ -11,36 +11,51 @@
 
 **********************************************************************/
 
-#include "ruby/encoding.h"
-#include "ruby/re.h"
-#include "internal.h"
-#include "encindex.h"
-#include "probes.h"
-#include "gc.h"
-#include "ruby_assert.h"
-#include "id.h"
-#include "debug_counter.h"
-#include "ruby/util.h"
+#include "ruby/internal/config.h"
 
-#define BEG(no) (regs->beg[(no)])
-#define END(no) (regs->end[(no)])
-
+#include <ctype.h>
 #include <errno.h>
 #include <math.h>
-#include <ctype.h>
 
 #ifdef HAVE_UNISTD_H
-#include <unistd.h>
+# include <unistd.h>
 #endif
 
 #if defined HAVE_CRYPT_R
 # if defined HAVE_CRYPT_H
-# include <crypt.h>
+#  include <crypt.h>
 # endif
 #elif !defined HAVE_CRYPT
 # include "missing/crypt.h"
 # define HAVE_CRYPT_R 1
 #endif
+
+#include "debug_counter.h"
+#include "encindex.h"
+#include "gc.h"
+#include "id.h"
+#include "internal.h"
+#include "internal/array.h"
+#include "internal/compar.h"
+#include "internal/compilers.h"
+#include "internal/encoding.h"
+#include "internal/error.h"
+#include "internal/gc.h"
+#include "internal/numeric.h"
+#include "internal/object.h"
+#include "internal/proc.h"
+#include "internal/re.h"
+#include "internal/sanitizers.h"
+#include "internal/string.h"
+#include "internal/transcode.h"
+#include "probes.h"
+#include "ruby/encoding.h"
+#include "ruby/re.h"
+#include "ruby/util.h"
+#include "ruby_assert.h"
+
+#define BEG(no) (regs->beg[(no)])
+#define END(no) (regs->end[(no)])
 
 #undef rb_str_new
 #undef rb_usascii_str_new
@@ -60,9 +75,6 @@
 #undef rb_str_cat2
 #undef rb_str_cat_cstr
 #undef rb_fstring_cstr
-#undef rb_fstring_enc_cstr
-
-static VALUE rb_str_clear(VALUE str);
 
 VALUE rb_cString;
 VALUE rb_cSymbol;
@@ -72,7 +84,10 @@ VALUE rb_cSymbol;
  * 1:     RSTRING_NOEMBED
  * 2:     STR_SHARED (== ELTS_SHARED)
  * 2-6:   RSTRING_EMBED_LEN (5 bits == 32)
- * 6:     STR_IS_SHARED_M (shared, when RSTRING_NOEMBED==1 && klass==0)
+ * 5:     STR_SHARED_ROOT (RSTRING_NOEMBED==1 && STR_SHARED == 0, there may be
+ *                         other strings that rely on this string's buffer)
+ * 6:     STR_BORROWED (when RSTRING_NOEMBED==1 && klass==0, unsafe to recycle
+ *                      early, specific to rb_str_tmp_frozen_{acquire,release})
  * 7:     STR_TMPLOCK
  * 8-9:   ENC_CODERANGE (2 bits)
  * 10-16: ENCODING (7 bits == 128)
@@ -82,7 +97,8 @@ VALUE rb_cSymbol;
  */
 
 #define RUBY_MAX_CHAR_LEN 16
-#define STR_IS_SHARED_M FL_USER6
+#define STR_SHARED_ROOT FL_USER5
+#define STR_BORROWED FL_USER6
 #define STR_TMPLOCK FL_USER7
 #define STR_NOFREE FL_USER18
 #define STR_FAKESTR FL_USER19
@@ -155,13 +171,15 @@ VALUE rb_cSymbol;
     if (!FL_TEST(str, STR_FAKESTR)) { \
 	RB_OBJ_WRITE((str), &RSTRING(str)->as.heap.aux.shared, (shared_str)); \
 	FL_SET((str), STR_SHARED); \
+        FL_SET((shared_str), STR_SHARED_ROOT); \
 	if (RBASIC_CLASS((shared_str)) == 0) /* for CoW-friendliness */ \
-	    FL_SET_RAW((shared_str), STR_IS_SHARED_M); \
+	    FL_SET_RAW((shared_str), STR_BORROWED); \
     } \
 } while (0)
 
 #define STR_HEAP_PTR(str)  (RSTRING(str)->as.heap.ptr)
 #define STR_HEAP_SIZE(str) ((size_t)RSTRING(str)->as.heap.aux.capa + TERM_LEN(str))
+/* TODO: include the terminator size in capa. */
 
 #define STR_ENC_GET(str) get_encoding(str)
 
@@ -180,6 +198,7 @@ VALUE rb_cSymbol;
 static VALUE str_replace_shared_without_enc(VALUE str2, VALUE str);
 static VALUE str_new_shared(VALUE klass, VALUE str);
 static VALUE str_new_frozen(VALUE klass, VALUE orig);
+static VALUE str_new_frozen_buffer(VALUE klass, VALUE orig, int copy_encoding);
 static VALUE str_new_static(VALUE klass, const char *ptr, long len, int encindex);
 static void str_make_independent_expand(VALUE str, long len, long expand, const int termlen);
 static inline void str_modifiable(VALUE str);
@@ -258,7 +277,7 @@ const struct st_hash_type rb_fstring_hash_type = {
     rb_str_hash,
 };
 
-#define BARE_STRING_P(str) (!FL_ANY_RAW(str, FL_TAINT|FL_EXIVAR) && RBASIC_CLASS(str) == rb_cString)
+#define BARE_STRING_P(str) (!FL_ANY_RAW(str, FL_EXIVAR) && RBASIC_CLASS(str) == rb_cString)
 
 static int
 fstr_update_callback(st_data_t *key, st_data_t *value, st_data_t arg, int existing)
@@ -286,7 +305,8 @@ fstr_update_callback(st_data_t *key, st_data_t *value, st_data_t arg, int existi
 	    OBJ_FREEZE_RAW(str);
 	}
 	else {
-	    str = str_new_frozen(rb_cString, str);
+	    if (!OBJ_FROZEN(str))
+		str = str_new_frozen(rb_cString, str);
 	    if (STR_SHARED_P(str)) { /* str should not be shared */
 		/* shared substring  */
 		str_make_independent(str);
@@ -316,9 +336,15 @@ rb_fstring(VALUE str)
 	return str;
 
     bare = BARE_STRING_P(str);
-    if (STR_EMBED_P(str) && !bare) {
-	OBJ_FREEZE_RAW(str);
-	return str;
+    if (!bare) {
+        if (STR_EMBED_P(str)) {
+            OBJ_FREEZE_RAW(str);
+            return str;
+        }
+        if (FL_TEST_RAW(str, STR_NOEMBED|STR_SHARED_ROOT|STR_SHARED) == (STR_NOEMBED|STR_SHARED_ROOT)) {
+            assert(OBJ_FROZEN(str));
+            return str;
+        }
     }
 
     if (!OBJ_FROZEN(str))
@@ -349,7 +375,6 @@ register_fstring(VALUE str)
     assert(OBJ_FROZEN(ret));
     assert(!FL_TEST_RAW(ret, STR_FAKESTR));
     assert(!FL_TEST_RAW(ret, FL_EXIVAR));
-    assert(!FL_TEST_RAW(ret, FL_TAINT));
     assert(RBASIC_CLASS(ret) == rb_cString);
     return ret;
 }
@@ -401,12 +426,6 @@ VALUE
 rb_fstring_cstr(const char *ptr)
 {
     return rb_fstring_new(ptr, strlen(ptr));
-}
-
-VALUE
-rb_fstring_enc_cstr(const char *ptr, rb_encoding *enc)
-{
-    return rb_fstring_enc_new(ptr, strlen(ptr), enc);
 }
 
 static int
@@ -892,28 +911,15 @@ rb_enc_str_new_static(const char *ptr, long len, rb_encoding *enc)
 VALUE
 rb_tainted_str_new(const char *ptr, long len)
 {
-    VALUE str = rb_str_new(ptr, len);
-
-    OBJ_TAINT(str);
-    return str;
-}
-
-static VALUE
-rb_tainted_str_new_with_enc(const char *ptr, long len, rb_encoding *enc)
-{
-    VALUE str = rb_enc_str_new(ptr, len, enc);
-
-    OBJ_TAINT(str);
-    return str;
+    rb_warn_deprecated_to_remove("rb_tainted_str_new", "3.2");
+    return rb_str_new(ptr, len);
 }
 
 VALUE
 rb_tainted_str_new_cstr(const char *ptr)
 {
-    VALUE str = rb_str_new_cstr(ptr);
-
-    OBJ_TAINT(str);
-    return str;
+    rb_warn_deprecated_to_remove("rb_tainted_str_new_cstr", "3.2");
+    return rb_str_new_cstr(ptr);
 }
 
 static VALUE str_cat_conv_enc_opts(VALUE newstr, long ofs, const char *ptr, long len,
@@ -946,7 +952,6 @@ rb_str_conv_enc_opts(VALUE str, rb_encoding *from, rb_encoding *to, int ecflags,
 	/* some error, return original */
 	return str;
     }
-    OBJ_INFECT(newstr, str);
     return newstr;
 }
 
@@ -1051,28 +1056,28 @@ rb_external_str_new_with_enc(const char *ptr, long len, rb_encoding *eenc)
     const int eidx = rb_enc_to_index(eenc);
 
     if (!ptr) {
-	return rb_tainted_str_new_with_enc(ptr, len, eenc);
+        return rb_enc_str_new(ptr, len, eenc);
     }
 
     /* ASCII-8BIT case, no conversion */
     if ((eidx == rb_ascii8bit_encindex()) ||
 	(eidx == rb_usascii_encindex() && search_nonascii(ptr, ptr + len))) {
-	return rb_tainted_str_new(ptr, len);
+        return rb_str_new(ptr, len);
     }
     /* no default_internal or same encoding, no conversion */
     ienc = rb_default_internal_encoding();
     if (!ienc || eenc == ienc) {
-	return rb_tainted_str_new_with_enc(ptr, len, eenc);
+        return rb_enc_str_new(ptr, len, eenc);
     }
     /* ASCII compatible, and ASCII only string, no conversion in
      * default_internal */
     if ((eidx == rb_ascii8bit_encindex()) ||
 	(eidx == rb_usascii_encindex()) ||
 	(rb_enc_asciicompat(eenc) && !search_nonascii(ptr, ptr + len))) {
-	return rb_tainted_str_new_with_enc(ptr, len, ienc);
+        return rb_enc_str_new(ptr, len, ienc);
     }
     /* convert from the given encoding to default_internal */
-    str = rb_tainted_str_new_with_enc(NULL, 0, ienc);
+    str = rb_enc_str_new(NULL, 0, ienc);
     /* when the conversion failed for some reason, just ignore the
      * default_internal and result in the given encoding as-is. */
     if (NIL_P(rb_str_cat_conv_enc_opts(str, 0, ptr, len, eenc, 0, Qnil))) {
@@ -1174,7 +1179,9 @@ str_replace_shared_without_enc(VALUE str2, VALUE str)
             RSTRING_GETMEM(root, ptr, len);
         }
         if (!STR_EMBED_P(str2) && !FL_TEST_RAW(str2, STR_SHARED|STR_NOFREE)) {
-            /* TODO: check if str2 is a shared root */
+            if (FL_TEST_RAW(str2, STR_SHARED_ROOT)) {
+                rb_fatal("about to free a possible shared root");
+            }
             char *ptr2 = STR_HEAP_PTR(str2);
             if (ptr2 != ptr) {
                 ruby_sized_xfree(ptr2, STR_HEAP_SIZE(str2));
@@ -1205,35 +1212,21 @@ str_new_shared(VALUE klass, VALUE str)
 VALUE
 rb_str_new_shared(VALUE str)
 {
-    VALUE str2 = str_new_shared(rb_obj_class(str), str);
-
-    OBJ_INFECT(str2, str);
-    return str2;
+    return str_new_shared(rb_obj_class(str), str);
 }
 
 VALUE
 rb_str_new_frozen(VALUE orig)
 {
-    VALUE str;
-
     if (OBJ_FROZEN(orig)) return orig;
-
-    str = str_new_frozen(rb_obj_class(orig), orig);
-    OBJ_INFECT(str, orig);
-    return str;
+    return str_new_frozen(rb_obj_class(orig), orig);
 }
 
 VALUE
 rb_str_tmp_frozen_acquire(VALUE orig)
 {
-    VALUE tmp;
-
     if (OBJ_FROZEN_RAW(orig)) return orig;
-
-    tmp = str_new_frozen(0, orig);
-    OBJ_INFECT(tmp, orig);
-
-    return tmp;
+    return str_new_frozen_buffer(0, orig, FALSE);
 }
 
 void
@@ -1250,7 +1243,7 @@ rb_str_tmp_frozen_release(VALUE orig, VALUE tmp)
 	    !FL_TEST_RAW(orig, STR_TMPLOCK|RUBY_FL_FREEZE)) {
 	VALUE shared = RSTRING(orig)->as.heap.aux.shared;
 
-	if (shared == tmp && !FL_TEST_RAW(tmp, STR_IS_SHARED_M)) {
+	if (shared == tmp && !FL_TEST_RAW(tmp, STR_BORROWED)) {
 	    FL_UNSET_RAW(orig, STR_SHARED);
 	    assert(RSTRING(orig)->as.heap.ptr == RSTRING(tmp)->as.heap.ptr);
 	    assert(RSTRING(orig)->as.heap.len == RSTRING(tmp)->as.heap.len);
@@ -1264,6 +1257,12 @@ rb_str_tmp_frozen_release(VALUE orig, VALUE tmp)
 
 static VALUE
 str_new_frozen(VALUE klass, VALUE orig)
+{
+    return str_new_frozen_buffer(klass, orig, TRUE);
+}
+
+static VALUE
+str_new_frozen_buffer(VALUE klass, VALUE orig, int copy_encoding)
 {
     VALUE str;
 
@@ -1280,7 +1279,6 @@ str_new_frozen(VALUE klass, VALUE orig)
 
 	    if ((ofs > 0) || (rest > 0) ||
 		(klass != RBASIC(shared)->klass) ||
-		((RBASIC(shared)->flags ^ RBASIC(orig)->flags) & FL_TAINT) ||
 		ENCODING_GET(shared) != ENCODING_GET(orig)) {
 		str = str_new_shared(klass, shared);
 		RSTRING(str)->as.heap.ptr += ofs;
@@ -1288,7 +1286,7 @@ str_new_frozen(VALUE klass, VALUE orig)
 	    }
 	    else {
 		if (RBASIC_CLASS(shared) == 0)
-		    FL_SET_RAW(shared, STR_IS_SHARED_M);
+		    FL_SET_RAW(shared, STR_BORROWED);
 		return shared;
 	    }
 	}
@@ -1309,11 +1307,11 @@ str_new_frozen(VALUE klass, VALUE orig)
 	    RBASIC(orig)->flags &= ~STR_NOFREE;
 	    STR_SET_SHARED(orig, str);
 	    if (klass == 0)
-		FL_UNSET_RAW(str, STR_IS_SHARED_M);
+		FL_UNSET_RAW(str, STR_BORROWED);
 	}
     }
 
-    rb_enc_cr_str_exact_copy(str, orig);
+    if (copy_encoding) rb_enc_cr_str_exact_copy(str, orig);
     OBJ_FREEZE(str);
     return str;
 }
@@ -1329,11 +1327,10 @@ str_new_empty(VALUE str)
 {
     VALUE v = rb_str_new_with_class(str, 0, 0);
     rb_enc_copy(v, str);
-    OBJ_INFECT(v, str);
     return v;
 }
 
-#define STR_BUF_MIN_SIZE 127
+#define STR_BUF_MIN_SIZE 63
 STATIC_ASSERT(STR_BUF_MIN_SIZE, STR_BUF_MIN_SIZE > RSTRING_EMBED_LEN_MAX);
 
 VALUE
@@ -1429,7 +1426,6 @@ str_shared_replace(VALUE str, VALUE str2)
     enc = STR_ENC_GET(str2);
     cr = ENC_CODERANGE(str2);
     str_discard(str);
-    OBJ_INFECT(str, str2);
     termlen = rb_enc_mbminlen(enc);
 
     if (STR_EMBEDDABLE_P(RSTRING_LEN(str2), termlen)) {
@@ -1479,9 +1475,6 @@ rb_obj_as_string_result(VALUE str, VALUE obj)
 {
     if (!RB_TYPE_P(str, T_STRING))
 	return rb_any_to_s(obj);
-    if (!FL_TEST_RAW(str, RSTRING_FSTR) && FL_ABLE(obj))
-	/* fstring must not be tainted, at least */
-	OBJ_INFECT_RAW(str, obj);
     return str;
 }
 
@@ -1504,7 +1497,6 @@ str_replace(VALUE str, VALUE str2)
 	str_replace_shared(str, str2);
     }
 
-    OBJ_INFECT(str, str2);
     return str;
 }
 
@@ -1515,10 +1507,11 @@ str_duplicate(VALUE klass, VALUE str)
     const VALUE flag_mask =
 	RSTRING_NOEMBED | RSTRING_EMBED_LEN_MASK |
 	ENC_CODERANGE_MASK | ENCODING_MASK |
-	FL_TAINT | FL_FREEZE
+        FL_FREEZE
 	;
     VALUE flags = FL_TEST_RAW(str, flag_mask);
     VALUE dup = str_alloc(klass);
+    int encidx = 0;
     MEMCPY(RSTRING(dup)->as.ary, RSTRING(str)->as.ary,
 	   char, embed_size);
     if (flags & STR_NOEMBED) {
@@ -1527,7 +1520,6 @@ str_duplicate(VALUE klass, VALUE str)
         }
         else if (UNLIKELY(!(flags & FL_FREEZE))) {
             str = str_new_frozen(klass, str);
-            FL_SET_RAW(str, flags & FL_TAINT);
             flags = FL_TEST_RAW(str, flag_mask);
 	}
 	if (flags & STR_NOEMBED) {
@@ -1539,7 +1531,12 @@ str_duplicate(VALUE klass, VALUE str)
 		   char, embed_size);
 	}
     }
+    if ((flags & ENCODING_MASK) == (ENCODING_INLINE_MAX<<ENCODING_SHIFT)) {
+	encidx = rb_enc_get_index(str);
+	flags &= ~ENCODING_MASK;
+    }
     FL_SET_RAW(dup, flags & ~FL_FREEZE);
+    if (encidx) rb_enc_associate_index(dup, encidx);
     return dup;
 }
 
@@ -1558,21 +1555,75 @@ rb_str_resurrect(VALUE str)
 
 /*
  *  call-seq:
- *     String.new(str="")                   -> new_str
- *     String.new(str="", encoding: enc)    -> new_str
- *     String.new(str="", capacity: size)   -> new_str
+ *     String.new(str='')                   -> new_str
+ *     String.new(str='', encoding: enc)    -> new_str
+ *     String.new(str='', capacity: size)   -> new_str
  *
- *  Returns a new string object containing a copy of <i>str</i>.
+ *  Argument +str+, if given, it must be a \String.
  *
- *  The optional <i>encoding</i> keyword argument specifies the encoding
- *  of the new string.
- *  If not specified, the encoding of <i>str</i> is used
- *  (or ASCII-8BIT, if <i>str</i> is not specified).
+ *  Argument +encoding+, if given, must be the \String name of an encoding
+ *  that is compatible with +str+.
  *
- *  The optional <i>capacity</i> keyword argument specifies the size
- *  of the internal buffer.
- *  This may improve performance, when the string will be concatenated many
- *  times (causing many realloc calls).
+ *  Argument +capacity+, if given, must be an \Integer.
+ *
+ *  The +str+, +encoding+, and +capacity+ arguments may all be used together:
+ *    String.new('hello', encoding: 'UTF-8', capacity: 25)
+ *
+ *  Returns a new \String that is a copy of <i>str</i>.
+ *
+ *  ---
+ *
+ *  With no arguments, returns the empty string with the Encoding <tt>ASCII-8BIT</tt>:
+ *    s = String.new
+ *    s # => ""
+ *    s.encoding # => #<Encoding:ASCII-8BIT>
+ *
+ *  With the single argument +str+, returns a copy of +str+
+ *  with the same encoding as +str+:
+ *    s = String.new("Que veut dire \u{e7}a?")
+ *    s # => "Que veut dire \u{e7}a?"
+ *    s.encoding # => #<Encoding:UTF-8>
+ *
+ *  Literal strings like <tt>""</tt> or here-documents always use
+ *  {script encoding}[Encoding.html#class-Encoding-label-Script+encoding], unlike String.new.
+ *
+ *  ---
+ *
+ *  With keyword +encoding+, returns a copy of +str+
+ *  with the specified encoding:
+ *    s = String.new(encoding: 'ASCII')
+ *    s.encoding # => #<Encoding:US-ASCII>
+ *    s = String.new('foo', encoding: 'ASCII')
+ *    s.encoding # => #<Encoding:US-ASCII>
+ *
+ *  Note that these are equivalent:
+ *    s0 = String.new('foo', encoding: 'ASCII')
+ *    s1 = 'foo'.force_encoding('ASCII')
+ *    s0.encoding == s1.encoding # => true
+ *
+ *  ---
+ *
+ *  With keyword +capacity+, returns a copy of +str+;
+ *  the given +capacity+ may set the size of the internal buffer,
+ *  which may affect performance:
+ *    String.new(capacity: 1) # => ""
+ *    String.new(capacity: 4096) # => ""
+ *
+ *  No exception is raised for zero or negative values:
+ *    String.new(capacity: 0) # => ""
+ *    String.new(capacity: -1) # => ""
+ *
+ *  ---
+ *
+ *  Raises an exception if the given +encoding+ is not a valid encoding name:
+ *    # Raises ArgumentError (unknown encoding name - FOO)
+ *    String.new(encoding: 'FOO')
+ *
+ *  Raises an exception if the given +encoding+ is incompatible with +str+:
+ *    utf8 = "Que veut dire \u{e7}a?"
+ *    ascii = "Que veut dire \u{e7}a?".force_encoding('ASCII')
+ *    # Raises Encoding::CompatibilityError (incompatible character encodings: UTF-8 and US-ASCII)
+ *    utf8.include? ascii
  */
 
 static VALUE
@@ -1660,7 +1711,7 @@ rb_str_init(int argc, VALUE *argv, VALUE str)
 
 /*
  * UTF-8 leading bytes have either 0xxxxxxx or 11xxxxxx
- * bit representation. (see http://en.wikipedia.org/wiki/UTF-8)
+ * bit representation. (see https://en.wikipedia.org/wiki/UTF-8)
  * Therefore, the following pseudocode can detect UTF-8 leading bytes.
  *
  * if (!(byte & 0x80))
@@ -1944,7 +1995,6 @@ rb_str_plus(VALUE str1, VALUE str2)
     memcpy(ptr3+len1, ptr2, len2);
     TERM_FILL(&ptr3[len1+len2], termlen);
 
-    FL_SET_RAW(str3, OBJ_TAINTED_RAW(str1) | OBJ_TAINTED_RAW(str2));
     ENCODING_CODERANGE_SET(str3, rb_enc_to_index(enc),
 			   ENC_CODERANGE_AND(ENC_CODERANGE(str1), ENC_CODERANGE(str2)));
     RB_GC_GUARD(str1);
@@ -2008,7 +2058,6 @@ rb_str_times(VALUE str, VALUE times)
     if (times == INT2FIX(0)) {
 	str2 = str_alloc(rb_obj_class(str));
 	rb_enc_copy(str2, str);
-	OBJ_INFECT(str2, str);
 	return str2;
     }
     len = NUM2LONG(times);
@@ -2024,7 +2073,6 @@ rb_str_times(VALUE str, VALUE times)
        }
        STR_SET_LEN(str2, len);
        rb_enc_copy(str2, str);
-       OBJ_INFECT(str2, str);
        return str2;
     }
     if (len && LONG_MAX/len <  RSTRING_LEN(str)) {
@@ -2046,7 +2094,6 @@ rb_str_times(VALUE str, VALUE times)
     }
     STR_SET_LEN(str2, len);
     TERM_FILL(&ptr2[len], termlen);
-    OBJ_INFECT(str2, str);
     rb_enc_cr_str_copy_for_substr(str2, str);
 
     return str2;
@@ -2162,7 +2209,7 @@ rb_str_modify_expand(VALUE str, long expand)
     if (expand < 0) {
 	rb_raise(rb_eArgError, "negative expanding string size");
     }
-    if (expand > LONG_MAX - len) {
+    if (expand >= LONG_MAX - len) {
 	rb_raise(rb_eArgError, "string size too big");
     }
 
@@ -2524,7 +2571,6 @@ rb_str_subseq(VALUE str, long beg, long len)
     }
 
     rb_enc_cr_str_copy_for_substr(str2, str);
-    OBJ_INFECT(str2, str);
 
     return str2;
 }
@@ -2641,7 +2687,6 @@ str_substr(VALUE str, long beg, long len, int empty)
     else {
 	if (!len && !empty) return Qnil;
 	str2 = rb_str_new_with_class(str, p, len);
-	OBJ_INFECT(str2, str);
 	RB_GC_GUARD(str);
     }
     rb_enc_cr_str_copy_for_substr(str2, str);
@@ -2683,8 +2728,8 @@ str_uplus(VALUE str)
  *
  * Returns a frozen, possibly pre-existing copy of the string.
  *
- * The string will be deduplicated as long as it is not tainted,
- * or has any instance variables set on it.
+ * The string will be deduplicated as long as it does not have
+ * any instance variables set on it.
  */
 static VALUE
 str_uminus(VALUE str)
@@ -2912,9 +2957,7 @@ rb_enc_cr_str_buf_cat(VALUE str, const char *ptr, long len,
         ptr_cr != ENC_CODERANGE_7BIT) {
 	str_enc = rb_enc_from_index(str_encindex);
 	ptr_enc = rb_enc_from_index(ptr_encindex);
-      incompatible:
-        rb_raise(rb_eEncCompatError, "incompatible character encodings: %s and %s",
-		 rb_enc_name(str_enc), rb_enc_name(ptr_enc));
+        goto incompatible;
     }
 
     if (str_cr == ENC_CODERANGE_UNKNOWN) {
@@ -2950,6 +2993,11 @@ rb_enc_cr_str_buf_cat(VALUE str, const char *ptr, long len,
     str_buf_cat(str, ptr, len);
     ENCODING_CODERANGE_SET(str, res_encindex, res_cr);
     return str;
+
+  incompatible:
+    rb_raise(rb_eEncCompatError, "incompatible character encodings: %s and %s",
+             rb_enc_name(str_enc), rb_enc_name(ptr_enc));
+    UNREACHABLE_RETURN(Qundef);
 }
 
 VALUE
@@ -2993,7 +3041,6 @@ rb_str_buf_append(VALUE str, VALUE str2)
     rb_enc_cr_str_buf_cat(str, RSTRING_PTR(str2), RSTRING_LEN(str2),
         ENCODING_GET(str2), str2_cr, &str2_cr);
 
-    OBJ_INFECT(str, str2);
     ENC_CODERANGE_SET(str2, str2_cr);
 
     return str;
@@ -3035,7 +3082,6 @@ rb_str_concat_literals(size_t num, const VALUE *strary)
 
 	rb_enc_cr_str_buf_cat(str, RSTRING_PTR(v), RSTRING_LEN(v),
 			      encidx, ENC_CODERANGE(v), NULL);
-	OBJ_INFECT_RAW(str, v);
 	if (encidx != ENCINDEX_US_ASCII) {
 	    if (ENCODING_GET_INLINED(str) == ENCINDEX_US_ASCII)
 		rb_enc_set_index(str, encidx);
@@ -3417,8 +3463,8 @@ str_casecmp(VALUE str1, VALUE str2)
     if (single_byte_optimizable(str1) && single_byte_optimizable(str2)) {
 	while (p1 < p1end && p2 < p2end) {
 	    if (*p1 != *p2) {
-		unsigned int c1 = TOUPPER(*p1 & 0xff);
-		unsigned int c2 = TOUPPER(*p2 & 0xff);
+                unsigned int c1 = TOLOWER(*p1 & 0xff);
+                unsigned int c2 = TOLOWER(*p2 & 0xff);
                 if (c1 != c2)
                     return INT2FIX(c1 < c2 ? -1 : 1);
 	    }
@@ -3432,8 +3478,8 @@ str_casecmp(VALUE str1, VALUE str2)
             int l2, c2 = rb_enc_ascget(p2, p2end, &l2, enc);
 
             if (0 <= c1 && 0 <= c2) {
-                c1 = TOUPPER(c1);
-                c2 = TOUPPER(c2);
+                c1 = TOLOWER(c1);
+                c2 = TOLOWER(c2);
                 if (c1 != c2)
                     return INT2FIX(c1 < c2 ? -1 : 1);
             }
@@ -3606,34 +3652,25 @@ rb_str_index_m(int argc, VALUE *argv, VALUE str)
 	}
     }
 
-    if (SPECIAL_CONST_P(sub)) goto generic;
-    switch (BUILTIN_TYPE(sub)) {
-      case T_REGEXP:
+    if (RB_TYPE_P(sub, T_REGEXP)) {
 	if (pos > str_strlen(str, NULL))
 	    return Qnil;
 	pos = str_offset(RSTRING_PTR(str), RSTRING_END(str), pos,
 			 rb_enc_check(str, sub), single_byte_optimizable(str));
 
-	pos = rb_reg_search(sub, str, pos, 0);
-	pos = rb_str_sublen(str, pos);
-	break;
-
-      generic:
-      default: {
-	VALUE tmp;
-
-	tmp = rb_check_string_type(sub);
-	if (NIL_P(tmp)) {
-	    rb_raise(rb_eTypeError, "type mismatch: %s given",
-		     rb_obj_classname(sub));
-	}
-	sub = tmp;
-      }
-	/* fall through */
-      case T_STRING:
+	if (rb_reg_search(sub, str, pos, 0) < 0) {
+            return Qnil;
+        } else {
+            VALUE match = rb_backref_get();
+            struct re_registers *regs = RMATCH_REGS(match);
+            pos = rb_str_sublen(str, BEG(0));
+            return LONG2NUM(pos);
+        }
+    }
+    else {
+        StringValue(sub);
 	pos = rb_str_index(str, sub, pos);
 	pos = rb_str_sublen(str, pos);
-	break;
     }
 
     if (pos == -1) return Qnil;
@@ -3773,34 +3810,22 @@ rb_str_rindex_m(int argc, VALUE *argv, VALUE str)
 	pos = len;
     }
 
-    if (SPECIAL_CONST_P(sub)) goto generic;
-    switch (BUILTIN_TYPE(sub)) {
-      case T_REGEXP:
+    if (RB_TYPE_P(sub, T_REGEXP)) {
 	/* enc = rb_get_check(str, sub); */
 	pos = str_offset(RSTRING_PTR(str), RSTRING_END(str), pos,
 			 enc, single_byte_optimizable(str));
 
-	pos = rb_reg_search(sub, str, pos, 1);
-	pos = rb_str_sublen(str, pos);
-	if (pos >= 0) return LONG2NUM(pos);
-	break;
-
-      generic:
-      default: {
-	VALUE tmp;
-
-	tmp = rb_check_string_type(sub);
-	if (NIL_P(tmp)) {
-	    rb_raise(rb_eTypeError, "type mismatch: %s given",
-		     rb_obj_classname(sub));
-	}
-	sub = tmp;
-      }
-	/* fall through */
-      case T_STRING:
+	if (rb_reg_search(sub, str, pos, 1) >= 0) {
+            VALUE match = rb_backref_get();
+            struct re_registers *regs = RMATCH_REGS(match);
+            pos = rb_str_sublen(str, BEG(0));
+            return LONG2NUM(pos);
+        }
+    }
+    else {
+        StringValue(sub);
 	pos = rb_str_rindex(str, sub, pos);
 	if (pos >= 0) return LONG2NUM(pos);
-	break;
     }
     return Qnil;
 }
@@ -3809,32 +3834,35 @@ rb_str_rindex_m(int argc, VALUE *argv, VALUE str)
  *  call-seq:
  *     str =~ obj   -> integer or nil
  *
- *  Match---If <i>obj</i> is a Regexp, use it as a pattern to match
- *  against <i>str</i>,and returns the position the match starts, or
- *  <code>nil</code> if there is no match. Otherwise, invokes
- *  <i>obj.=~</i>, passing <i>str</i> as an argument. The default
- *  <code>=~</code> in Object returns <code>nil</code>.
- *
- *  Note: <code>str =~ regexp</code> is not the same as
- *  <code>regexp =~ str</code>. Strings captured from named capture groups
- *  are assigned to local variables only in the second case.
+ *  Match---If <i>obj</i> is a Regexp, uses it as a pattern to match
+ *  against the receiver, and returns the position the match starts,
+ *  or +nil+ if there is no match. Otherwise, invokes <i>obj.=~</i>,
+ *  passing the string as an argument.
+ *  The default Object#=~ (deprecated) returns +nil+.
  *
  *     "cat o' 9 tails" =~ /\d/   #=> 7
  *     "cat o' 9 tails" =~ 9      #=> nil
+ *
+ *  Note that <code>string =~ regexp</code> is not the same as
+ *  <code>regexp =~ string</code>. Strings captured from named capture groups
+ *  are assigned to local variables only in the second case.
+ *
+ *     "no. 9" =~ /(?<number>\d+)/
+ *     number                        #=> nil (not assigned)
+ *     /(?<number>\d+)/ =~ "no. 9"
+ *     number                        #=> "9"
  */
 
 static VALUE
 rb_str_match(VALUE x, VALUE y)
 {
-    if (SPECIAL_CONST_P(y)) goto generic;
-    switch (BUILTIN_TYPE(y)) {
+    switch (OBJ_BUILTIN_TYPE(y)) {
       case T_STRING:
 	rb_raise(rb_eTypeError, "type mismatch: String given");
 
       case T_REGEXP:
 	return rb_reg_match(y, x);
 
-      generic:
       default:
 	return rb_funcall(y, idEqTilde, 1, x);
     }
@@ -3846,13 +3874,13 @@ static VALUE get_pat(VALUE);
 
 /*
  *  call-seq:
- *     str.match(pattern)        -> matchdata or nil
- *     str.match(pattern, pos)   -> matchdata or nil
+ *     str.match(pattern, pos=0)                   -> matchdata or nil
+ *     str.match(pattern, pos=0) {|match| block }  -> obj
  *
  *  Converts <i>pattern</i> to a Regexp (if it isn't already one),
- *  then invokes its <code>match</code> method on <i>str</i>.  If the second
- *  parameter is present, it specifies the position in the string to begin the
- *  search.
+ *  then invokes its <code>match</code> method on the receiver.
+ *  If the second parameter is present, it specifies the position
+ *  in the string to begin the search.
  *
  *     'hello'.match('(.)\1')      #=> #<MatchData "ll" 1:"l">
  *     'hello'.match('(.)\1')[0]   #=> "ll"
@@ -3860,18 +3888,18 @@ static VALUE get_pat(VALUE);
  *     'hello'.match(/(.)\1/, 3)   #=> nil
  *     'hello'.match('xx')         #=> nil
  *
- *  If a block is given, invoke the block with MatchData if match succeed, so
- *  that you can write
+ *  If a block is given, invokes the block with MatchData if match succeeds,
+ *  so that you can write
  *
- *     str.match(pat) {|m| ...}
+ *     str.match(pat) {|m| block }
  *
  *  instead of
  *
  *     if m = str.match(pat)
- *       ...
+ *       # ...
  *     end
  *
- *  The return value is a value from block execution in this case.
+ *  The return value in this case is the value from block execution.
  */
 
 static VALUE
@@ -4131,7 +4159,6 @@ rb_str_succ(VALUE orig)
     VALUE str;
     str = rb_str_new_with_class(orig, RSTRING_PTR(orig), RSTRING_LEN(orig));
     rb_enc_cr_str_copy_for_substr(str, orig);
-    OBJ_INFECT(str, orig);
     return str_succ(str);
 }
 
@@ -4646,7 +4673,6 @@ rb_str_splice_0(VALUE str, long beg, long len, VALUE val)
 
     if (beg == 0 && vlen == 0) {
 	rb_str_drop_bytes(str, len);
-	OBJ_INFECT(str, val);
 	return;
     }
 
@@ -4677,7 +4703,6 @@ rb_str_splice_0(VALUE str, long beg, long len, VALUE val)
     slen += vlen - len;
     STR_SET_LEN(str, slen);
     TERM_FILL(&sptr[slen], TERM_LEN(str));
-    OBJ_INFECT(str, val);
     ENC_CODERANGE_SET(str, cr);
 }
 
@@ -4696,14 +4721,10 @@ rb_str_update(VALUE str, long beg, long len, VALUE val)
     enc = rb_enc_check(str, val);
     slen = str_strlen(str, enc); /* rb_enc_check */
 
-    if (slen < beg) {
-      out_of_range:
+    if ((slen < beg) || ((beg < 0) && (beg + slen < 0))) {
 	rb_raise(rb_eIndexError, "index %ld out of string", beg);
     }
     if (beg < 0) {
-	if (beg + slen < 0) {
-	    goto out_of_range;
-	}
 	beg += slen;
     }
     assert(beg >= 0);
@@ -4743,14 +4764,10 @@ rb_str_subpat_set(VALUE str, VALUE re, VALUE backref, VALUE val)
     match = rb_backref_get();
     nth = rb_reg_backref_number(match, backref);
     regs = RMATCH_REGS(match);
-    if (nth >= regs->num_regs) {
-      out_of_range:
+    if ((nth >= regs->num_regs) || ((nth < 0) && (-nth >= regs->num_regs))) {
 	rb_raise(rb_eIndexError, "index %d out of regexp", nth);
     }
     if (nth < 0) {
-	if (-nth >= regs->num_regs) {
-	    goto out_of_range;
-	}
 	nth += regs->num_regs;
     }
 
@@ -4771,15 +4788,7 @@ rb_str_aset(VALUE str, VALUE indx, VALUE val)
 {
     long idx, beg;
 
-    if (FIXNUM_P(indx)) {
-	idx = FIX2LONG(indx);
-      num_index:
-	rb_str_splice(str, idx, 1, val);
-	return val;
-    }
-
-    if (SPECIAL_CONST_P(indx)) goto generic;
-    switch (BUILTIN_TYPE(indx)) {
+    switch (TYPE(indx)) {
       case T_REGEXP:
 	rb_str_subpat_set(str, indx, INT2FIX(0), val);
 	return val;
@@ -4793,7 +4802,6 @@ rb_str_aset(VALUE str, VALUE indx, VALUE val)
 	rb_str_splice(str, beg, str_strlen(indx, NULL), val);
 	return val;
 
-      generic:
       default:
 	/* check if indx is Range */
 	{
@@ -4803,8 +4811,12 @@ rb_str_aset(VALUE str, VALUE indx, VALUE val)
 		return val;
 	    }
 	}
+        /* FALLTHROUGH */
+
+      case T_FIXNUM:
 	idx = NUM2LONG(indx);
-	goto num_index;
+        rb_str_splice(str, idx, 1, val);
+        return val;
     }
 }
 
@@ -4903,19 +4915,83 @@ rb_str_insert(VALUE str, VALUE idx, VALUE str2)
 static VALUE
 rb_str_slice_bang(int argc, VALUE *argv, VALUE str)
 {
-    VALUE result;
-    VALUE buf[3];
-    int i;
+    VALUE result = Qnil;
+    VALUE indx;
+    long beg, len = 1;
+    char *p;
 
     rb_check_arity(argc, 1, 2);
-    for (i=0; i<argc; i++) {
-	buf[i] = argv[i];
-    }
     str_modify_keep_cr(str);
-    result = rb_str_aref_m(argc, buf, str);
-    if (!NIL_P(result)) {
-	buf[i] = rb_str_new(0,0);
-	rb_str_aset_m(argc+1, buf, str);
+    indx = argv[0];
+    if (RB_TYPE_P(indx, T_REGEXP)) {
+	if (rb_reg_search(indx, str, 0, 0) < 0) return Qnil;
+	VALUE match = rb_backref_get();
+	struct re_registers *regs = RMATCH_REGS(match);
+	int nth = 0;
+	if (argc > 1 && (nth = rb_reg_backref_number(match, argv[1])) < 0) {
+	    if ((nth += regs->num_regs) <= 0) return Qnil;
+	}
+	else if (nth >= regs->num_regs) return Qnil;
+	beg = BEG(nth);
+	len = END(nth) - beg;
+        goto subseq;
+    }
+    else if (argc == 2) {
+	beg = NUM2LONG(indx);
+	len = NUM2LONG(argv[1]);
+        goto num_index;
+    }
+    else if (FIXNUM_P(indx)) {
+	beg = FIX2LONG(indx);
+	if (!(p = rb_str_subpos(str, beg, &len))) return Qnil;
+	if (!len) return Qnil;
+	beg = p - RSTRING_PTR(str);
+	goto subseq;
+    }
+    else if (RB_TYPE_P(indx, T_STRING)) {
+	beg = rb_str_index(str, indx, 0);
+	if (beg == -1) return Qnil;
+	len = RSTRING_LEN(indx);
+	result = rb_str_dup(indx);
+        goto squash;
+    }
+    else {
+	switch (rb_range_beg_len(indx, &beg, &len, str_strlen(str, NULL), 0)) {
+	  case Qnil:
+	    return Qnil;
+	  case Qfalse:
+	    beg = NUM2LONG(indx);
+	    goto num_index;
+	  default:
+	    goto num_index;
+	}
+    }
+
+  num_index:
+    if (!(p = rb_str_subpos(str, beg, &len))) return Qnil;
+    beg = p - RSTRING_PTR(str);
+
+  subseq:
+    result = rb_str_new_with_class(str, RSTRING_PTR(str)+beg, len);
+    rb_enc_cr_str_copy_for_substr(result, str);
+
+  squash:
+    if (len > 0) {
+	if (beg == 0) {
+	    rb_str_drop_bytes(str, len);
+	}
+	else {
+	    char *sptr = RSTRING_PTR(str);
+	    long slen = RSTRING_LEN(str);
+	    if (beg + len > slen) /* pathological check */
+		len = slen - beg;
+	    memmove(sptr + beg,
+		    sptr + beg + len,
+		    slen - (beg + len));
+	    slen -= len;
+	    STR_SET_LEN(str, slen);
+	    TERM_FILL(&sptr[slen], TERM_LEN(str));
+	}
     }
     return result;
 }
@@ -4925,8 +5001,7 @@ get_pat(VALUE pat)
 {
     VALUE val;
 
-    if (SPECIAL_CONST_P(pat)) goto to_string;
-    switch (BUILTIN_TYPE(pat)) {
+    switch (OBJ_BUILTIN_TYPE(pat)) {
       case T_REGEXP:
 	return pat;
 
@@ -4934,7 +5009,6 @@ get_pat(VALUE pat)
 	break;
 
       default:
-      to_string:
 	val = rb_check_string_type(pat);
 	if (NIL_P(val)) {
 	    Check_Type(pat, T_REGEXP);
@@ -4950,8 +5024,7 @@ get_pat_quoted(VALUE pat, int check)
 {
     VALUE val;
 
-    if (SPECIAL_CONST_P(pat)) goto to_string;
-    switch (BUILTIN_TYPE(pat)) {
+    switch (OBJ_BUILTIN_TYPE(pat)) {
       case T_REGEXP:
 	return pat;
 
@@ -4959,7 +5032,6 @@ get_pat_quoted(VALUE pat, int check)
 	break;
 
       default:
-      to_string:
 	val = rb_check_string_type(pat);
 	if (NIL_P(val)) {
 	    Check_Type(pat, T_REGEXP);
@@ -4979,11 +5051,8 @@ rb_pat_search(VALUE pat, VALUE str, long pos, int set_backref_str)
 	pos = rb_strseq_index(str, pat, pos, 1);
 	if (set_backref_str) {
 	    if (pos >= 0) {
-		VALUE match;
 		str = rb_str_new_frozen(str);
 		rb_backref_set_string(str, pos, RSTRING_LEN(pat));
-		match = rb_backref_get();
-		OBJ_INFECT(match, pat);
 	    }
 	    else {
 		rb_backref_set(Qnil);
@@ -5013,7 +5082,6 @@ rb_str_sub_bang(int argc, VALUE *argv, VALUE str)
 {
     VALUE pat, repl, hash = Qnil;
     int iter = 0;
-    int tainted = 0;
     long plen;
     int min_arity = rb_block_given_p() ? 1 : 2;
     long beg;
@@ -5028,7 +5096,6 @@ rb_str_sub_bang(int argc, VALUE *argv, VALUE str)
 	if (NIL_P(hash)) {
 	    StringValue(repl);
 	}
-	tainted = OBJ_TAINTED_RAW(repl);
     }
 
     pat = get_pat_quoted(argv[0], 1);
@@ -5088,7 +5155,6 @@ rb_str_sub_bang(int argc, VALUE *argv, VALUE str)
         }
 	rb_str_modify(str);
 	rb_enc_associate(str, enc);
-	tainted |= OBJ_TAINTED_RAW(repl);
 	if (ENC_CODERANGE_UNKNOWN < cr && cr < ENC_CODERANGE_BROKEN) {
 	    int cr2 = ENC_CODERANGE(repl);
             if (cr2 == ENC_CODERANGE_BROKEN ||
@@ -5098,7 +5164,7 @@ rb_str_sub_bang(int argc, VALUE *argv, VALUE str)
                 cr = cr2;
 	}
 	plen = end0 - beg0;
-	rp = RSTRING_PTR(repl); rlen = RSTRING_LEN(repl);
+        rlen = RSTRING_LEN(repl);
 	len = RSTRING_LEN(str);
 	if (rlen > plen) {
 	    RESIZE_CAPA(str, len + rlen - plen);
@@ -5107,12 +5173,12 @@ rb_str_sub_bang(int argc, VALUE *argv, VALUE str)
 	if (rlen != plen) {
 	    memmove(p + beg0 + rlen, p + beg0 + plen, len - beg0 - plen);
 	}
+        rp = RSTRING_PTR(repl);
         memmove(p + beg0, rp, rlen);
 	len += rlen - plen;
 	STR_SET_LEN(str, len);
 	TERM_FILL(&RSTRING_PTR(str)[len], TERM_LEN(str));
 	ENC_CODERANGE_SET(str, cr);
-	FL_SET_RAW(str, tainted);
 
 	return str;
     }
@@ -5129,30 +5195,31 @@ rb_str_sub_bang(int argc, VALUE *argv, VALUE str)
  *  Returns a copy of +str+ with the _first_ occurrence of +pattern+
  *  replaced by the second argument. The +pattern+ is typically a Regexp; if
  *  given as a String, any regular expression metacharacters it contains will
- *  be interpreted literally, e.g. <code>'\\\d'</code> will match a backslash
+ *  be interpreted literally, e.g. <code>\d</code> will match a backslash
  *  followed by 'd', instead of a digit.
  *
  *  If +replacement+ is a String it will be substituted for the matched text.
  *  It may contain back-references to the pattern's capture groups of the form
- *  <code>"\\d"</code>, where <i>d</i> is a group number, or
- *  <code>"\\k<n>"</code>, where <i>n</i> is a group name. If it is a
- *  double-quoted string, both back-references must be preceded by an
- *  additional backslash. However, within +replacement+ the special match
- *  variables, such as <code>$&</code>, will not refer to the current match.
- *  If +replacement+ is a String that looks like a pattern's capture group but
- *  is actually not a pattern capture group e.g. <code>"\\'"</code>, then it
- *  will have to be preceded by two backslashes like so <code>"\\\\'"</code>.
+ *  <code>\d</code>, where <i>d</i> is a group number, or
+ *  <code>\k<n></code>, where <i>n</i> is a group name.
+ *  Similarly, <code>\&</code>, <code>\'</code>, <code>\`</code>, and
+ *  <code>\+</code> correspond to special variables, <code>$&</code>,
+ *  <code>$'</code>, <code>$`</code>, and <code>$+</code>, respectively.
+ *  (See rdoc-ref:regexp.rdoc for details.)
+ *  <code>\0</code> is the same as <code>\&</code>.
+ *  <code>\\\\</code> is interpreted as an escape, i.e., a single backslash.
+ *  Note that, within +replacement+ the special match variables, such as
+ *  <code>$&</code>, will not refer to the current match.
  *
  *  If the second argument is a Hash, and the matched text is one of its keys,
  *  the corresponding value is the replacement string.
  *
  *  In the block form, the current match string is passed in as a parameter,
  *  and variables such as <code>$1</code>, <code>$2</code>, <code>$`</code>,
- *  <code>$&</code>, and <code>$'</code> will be set appropriately. The value
- *  returned by the block will be substituted for the match on each call.
- *
- *  The result inherits any tainting in the original string or any supplied
- *  replacement string.
+ *  <code>$&</code>, and <code>$'</code> will be set appropriately.
+ *  (See rdoc-ref:regexp.rdoc for details.)
+ *  The value returned by the block will be substituted for the match on each
+ *  call.
  *
  *     "hello".sub(/[aeiou]/, '*')                  #=> "h*llo"
  *     "hello".sub(/([aeiou])/, '<\1>')             #=> "h<e>llo"
@@ -5160,6 +5227,19 @@ rb_str_sub_bang(int argc, VALUE *argv, VALUE str)
  *     "hello".sub(/(?<foo>[aeiou])/, '*\k<foo>*')  #=> "h*e*llo"
  *     'Is SHELL your preferred shell?'.sub(/[[:upper:]]{2,}/, ENV)
  *      #=> "Is /bin/bash your preferred shell?"
+ *
+ *  Note that a string literal consumes backslashes.
+ *  (See rdoc-ref:syntax/literals.rdoc for details about string literals.)
+ *  Back-references are typically preceded by an additional backslash.
+ *  For example, if you want to write a back-reference <code>\&</code> in
+ *  +replacement+ with a double-quoted string literal, you need to write:
+ *  <code>"..\\\\&.."</code>.
+ *  If you want to write a non-back-reference string <code>\&</code> in
+ *  +replacement+, you need first to escape the backslash to prevent
+ *  this method from interpreting it as a back-reference, and then you
+ *  need to escape the backslashes again to prevent a string literal from
+ *  consuming them: <code>"..\\\\\\\\&.."</code>.
+ *  You may want to use the block form to avoid a lot of backslashes.
  */
 
 static VALUE
@@ -5179,7 +5259,6 @@ str_gsub(int argc, VALUE *argv, VALUE str, int bang)
     long offset, blen, slen, len, last;
     enum {STR, ITER, MAP} mode = STR;
     char *sp, *cp;
-    int tainted = 0;
     int need_backref = -1;
     rb_encoding *str_enc;
 
@@ -5197,7 +5276,6 @@ str_gsub(int argc, VALUE *argv, VALUE str, int bang)
 	else {
 	    mode = MAP;
 	}
-	tainted = OBJ_TAINTED_RAW(repl);
 	break;
       default:
         rb_error_arity(argc, 1, 2);
@@ -5257,8 +5335,6 @@ str_gsub(int argc, VALUE *argv, VALUE str, int bang)
 	    val = repl;
 	}
 
-	tainted |= OBJ_TAINTED_RAW(val);
-
 	len = beg0 - offset;	/* copy pre-match substr */
         if (len) {
             rb_enc_str_buf_cat(dest, cp, len, str_enc);
@@ -5291,11 +5367,9 @@ str_gsub(int argc, VALUE *argv, VALUE str, int bang)
     }
     else {
 	RBASIC_SET_CLASS(dest, rb_obj_class(str));
-	tainted |= OBJ_TAINTED_RAW(str);
 	str = dest;
     }
 
-    FL_SET_RAW(str, tainted);
     return str;
 }
 
@@ -5332,27 +5406,31 @@ rb_str_gsub_bang(int argc, VALUE *argv, VALUE str)
  *  <i>pattern</i> substituted for the second argument. The <i>pattern</i> is
  *  typically a Regexp; if given as a String, any
  *  regular expression metacharacters it contains will be interpreted
- *  literally, e.g. <code>'\\\d'</code> will match a backslash followed by 'd',
+ *  literally, e.g. <code>\d</code> will match a backslash followed by 'd',
  *  instead of a digit.
  *
- *  If <i>replacement</i> is a String it will be substituted for
- *  the matched text. It may contain back-references to the pattern's capture
- *  groups of the form <code>\\\d</code>, where <i>d</i> is a group number, or
- *  <code>\\\k<n></code>, where <i>n</i> is a group name. If it is a
- *  double-quoted string, both back-references must be preceded by an
- *  additional backslash. However, within <i>replacement</i> the special match
- *  variables, such as <code>$&</code>, will not refer to the current match.
+ *  If +replacement+ is a String it will be substituted for the matched text.
+ *  It may contain back-references to the pattern's capture groups of the form
+ *  <code>\d</code>, where <i>d</i> is a group number, or
+ *  <code>\k<n></code>, where <i>n</i> is a group name.
+ *  Similarly, <code>\&</code>, <code>\'</code>, <code>\`</code>, and
+ *  <code>\+</code> correspond to special variables, <code>$&</code>,
+ *  <code>$'</code>, <code>$`</code>, and <code>$+</code>, respectively.
+ *  (See rdoc-ref:regexp.rdoc for details.)
+ *  <code>\0</code> is the same as <code>\&</code>.
+ *  <code>\\\\</code> is interpreted as an escape, i.e., a single backslash.
+ *  Note that, within +replacement+ the special match variables, such as
+ *  <code>$&</code>, will not refer to the current match.
  *
  *  If the second argument is a Hash, and the matched text is one
  *  of its keys, the corresponding value is the replacement string.
  *
  *  In the block form, the current match string is passed in as a parameter,
  *  and variables such as <code>$1</code>, <code>$2</code>, <code>$`</code>,
- *  <code>$&</code>, and <code>$'</code> will be set appropriately. The value
- *  returned by the block will be substituted for the match on each call.
- *
- *  The result inherits any tainting in the original string or any supplied
- *  replacement string.
+ *  <code>$&</code>, and <code>$'</code> will be set appropriately.
+ *  (See rdoc-ref:regexp.rdoc for details.)
+ *  The value returned by the block will be substituted for the match on each
+ *  call.
  *
  *  When neither a block nor a second argument is supplied, an
  *  Enumerator is returned.
@@ -5362,6 +5440,19 @@ rb_str_gsub_bang(int argc, VALUE *argv, VALUE str)
  *     "hello".gsub(/./) {|s| s.ord.to_s + ' '}      #=> "104 101 108 108 111 "
  *     "hello".gsub(/(?<foo>[aeiou])/, '{\k<foo>}')  #=> "h{e}ll{o}"
  *     'hello'.gsub(/[eo]/, 'e' => 3, 'o' => '*')    #=> "h3ll*"
+ *
+ *  Note that a string literal consumes backslashes.
+ *  (See rdoc-ref:syntax/literals.rdoc for details on string literals.)
+ *  Back-references are typically preceded by an additional backslash.
+ *  For example, if you want to write a back-reference <code>\&</code> in
+ *  +replacement+ with a double-quoted string literal, you need to write:
+ *  <code>"..\\\\&.."</code>.
+ *  If you want to write a non-back-reference string <code>\&</code> in
+ *  +replacement+, you need first to escape the backslash to prevent
+ *  this method from interpreting it as a back-reference, and then you
+ *  need to escape the backslashes again to prevent a string literal from
+ *  consuming them: <code>"..\\\\\\\\&.."</code>.
+ *  You may want to use the block form to avoid a lot of backslashes.
  */
 
 static VALUE
@@ -5375,7 +5466,7 @@ rb_str_gsub(int argc, VALUE *argv, VALUE str)
  *  call-seq:
  *     str.replace(other_str)   -> str
  *
- *  Replaces the contents and taintedness of <i>str</i> with the corresponding
+ *  Replaces the contents of <i>str</i> with the corresponding
  *  values in <i>other_str</i>.
  *
  *     s = "hello"         #=> "hello"
@@ -5565,8 +5656,6 @@ str_byte_substr(VALUE str, long beg, long len, int empty)
 	}
     }
 
-    OBJ_INFECT_RAW(str2, str);
-
     return str2;
 }
 
@@ -5683,7 +5772,6 @@ rb_str_reverse(VALUE str)
 	}
     }
     STR_SET_LEN(rev, RSTRING_LEN(str));
-    OBJ_INFECT_RAW(rev, str);
     str_enc_copy(rev, str);
     ENC_CODERANGE_SET(rev, cr);
 
@@ -5937,7 +6025,6 @@ rb_str_escape(VALUE str)
     if (p > prev) str_buf_cat(result, prev, p - prev);
     ENCODING_CODERANGE_SET(result, rb_usascii_encindex(), ENC_CODERANGE_7BIT);
 
-    OBJ_INFECT_RAW(result, str);
     return result;
 }
 
@@ -6044,7 +6131,6 @@ rb_str_inspect(VALUE str)
     if (p > prev) str_buf_cat(result, prev, p - prev);
     str_buf_cat2(result, "\"");
 
-    OBJ_INFECT_RAW(result, str);
     return result;
 }
 
@@ -6207,7 +6293,6 @@ rb_str_dump(VALUE str)
 	snprintf(q, qend-q, nonascii_suffix, enc->name);
 	encidx = rb_ascii8bit_encindex();
     }
-    OBJ_INFECT_RAW(result, str);
     /* result from dump is ASCII */
     rb_enc_associate_index(result, encidx);
     ENC_CODERANGE_SET(result, ENC_CODERANGE_7BIT);
@@ -6234,9 +6319,8 @@ unescape_ascii(unsigned int c)
 	return '\007';
       case 'e':
 	return 033;
-      default:
-	UNREACHABLE;
     }
+    UNREACHABLE_RETURN(-1);
 }
 
 static void
@@ -6374,7 +6458,7 @@ str_undump(VALUE str)
 	rb_raise(rb_eRuntimeError, "non-ASCII character detected");
     }
     if (!str_null_check(str, &w)) {
-       rb_raise(rb_eRuntimeError, "string contains null byte");
+	rb_raise(rb_eRuntimeError, "string contains null byte");
     }
     if (RSTRING_LEN(str) < 2) goto invalid_format;
     if (*s != '"') goto invalid_format;
@@ -6442,7 +6526,6 @@ str_undump(VALUE str)
 	}
     }
 
-    OBJ_INFECT(undumped, str);
     return undumped;
 invalid_format:
     rb_raise(rb_eRuntimeError, "invalid dumped string; not wrapped with '\"' nor '\"...\".force_encoding(\"...\")' form");
@@ -6612,7 +6695,6 @@ rb_str_casemap(VALUE source, OnigCaseFoldType *flags, rb_encoding *enc)
     mapping_buffer_free(current_buffer);
 
     /* TODO: check about string terminator character */
-    OBJ_INFECT_RAW(target, source);
     str_enc_copy(target, source);
     /*ENC_CODERANGE_SET(mapped, cr);*/
 
@@ -6652,7 +6734,6 @@ rb_str_ascii_casemap(VALUE source, VALUE target, OnigCaseFoldType *flags, rb_enc
 		 "; old_length=%ld, new_length=%d\n", old_length, length_or_invalid);
     }
 
-    OBJ_INFECT_RAW(target, source);
     str_enc_copy(target, source);
 
     return target;
@@ -6734,7 +6815,6 @@ rb_str_upcase(int argc, VALUE *argv, VALUE str)
     enc = str_true_enc(str);
     if (case_option_single_p(flags, enc, str)) {
         ret = rb_str_new_with_class(str, RSTRING_PTR(str), RSTRING_LEN(str));
-        OBJ_INFECT_RAW(ret, str);
         str_enc_copy(ret, str);
         upcase_single(ret);
     }
@@ -6863,7 +6943,6 @@ rb_str_downcase(int argc, VALUE *argv, VALUE str)
     enc = str_true_enc(str);
     if (case_option_single_p(flags, enc, str)) {
         ret = rb_str_new_with_class(str, RSTRING_PTR(str), RSTRING_LEN(str));
-        OBJ_INFECT_RAW(ret, str);
         str_enc_copy(ret, str);
         downcase_single(ret);
     }
@@ -7032,8 +7111,8 @@ trnext(struct tr *t, rb_encoding *enc)
     int n;
 
     for (;;) {
+      nextpart:
 	if (!t->gen) {
-nextpart:
 	    if (t->p == t->pend) return -1;
 	    if (rb_enc_ascget(t->p, t->pend, &n, enc) == '\\' && t->p + n < t->pend) {
 		t->p += n;
@@ -7870,6 +7949,35 @@ split_string(VALUE result, VALUE str, long beg, long len, long empty_count)
     return empty_count;
 }
 
+typedef enum {
+    SPLIT_TYPE_AWK, SPLIT_TYPE_STRING, SPLIT_TYPE_REGEXP, SPLIT_TYPE_CHARS
+} split_type_t;
+
+static split_type_t
+literal_split_pattern(VALUE spat, split_type_t default_type)
+{
+    rb_encoding *enc = STR_ENC_GET(spat);
+    const char *ptr;
+    long len;
+    RSTRING_GETMEM(spat, ptr, len);
+    if (len == 0) {
+        /* Special case - split into chars */
+        return SPLIT_TYPE_CHARS;
+    }
+    else if (rb_enc_asciicompat(enc)) {
+        if (len == 1 && ptr[0] == ' ') {
+            return SPLIT_TYPE_AWK;
+        }
+    }
+    else {
+        int l;
+        if (rb_enc_ascget(ptr, ptr + len, &l, enc) == ' ' && len == l) {
+            return SPLIT_TYPE_AWK;
+        }
+    }
+    return default_type;
+}
+
 /*
  *  call-seq:
  *     str.split(pattern=nil, [limit])                -> an_array
@@ -7931,7 +8039,7 @@ rb_str_split_m(int argc, VALUE *argv, VALUE str)
     rb_encoding *enc;
     VALUE spat;
     VALUE limit;
-    enum {awk, string, regexp, chars} split_type;
+    split_type_t split_type;
     long beg, end, i = 0, empty_count = -1;
     int lim = 0;
     VALUE result, tmp;
@@ -7955,12 +8063,12 @@ rb_str_split_m(int argc, VALUE *argv, VALUE str)
     if (NIL_P(limit) && !lim) empty_count = 0;
 
     enc = STR_ENC_GET(str);
-    split_type = regexp;
+    split_type = SPLIT_TYPE_REGEXP;
     if (!NIL_P(spat)) {
 	spat = get_pat_quoted(spat, 0);
     }
     else if (NIL_P(spat = rb_fs)) {
-	split_type = awk;
+	split_type = SPLIT_TYPE_AWK;
     }
     else if (!(spat = rb_fs_check(spat))) {
 	rb_raise(rb_eTypeError, "value of $; must be String or Regexp");
@@ -7968,28 +8076,25 @@ rb_str_split_m(int argc, VALUE *argv, VALUE str)
     else {
         rb_warn("$; is set to non-nil value");
     }
-    if (split_type != awk) {
-	if (BUILTIN_TYPE(spat) == T_STRING) {
-	    rb_encoding *enc2 = STR_ENC_GET(spat);
+    if (split_type != SPLIT_TYPE_AWK) {
+        switch (BUILTIN_TYPE(spat)) {
+          case T_REGEXP:
+            rb_reg_options(spat); /* check if uninitialized */
+            tmp = RREGEXP_SRC(spat);
+            split_type = literal_split_pattern(tmp, SPLIT_TYPE_REGEXP);
+            if (split_type == SPLIT_TYPE_AWK) {
+                spat = tmp;
+                split_type = SPLIT_TYPE_STRING;
+            }
+            break;
 
+          case T_STRING:
 	    mustnot_broken(spat);
-	    split_type = string;
-	    if (RSTRING_LEN(spat) == 0) {
-		/* Special case - split into chars */
-                split_type = chars;
-	    }
-	    else if (rb_enc_asciicompat(enc2) == 1) {
-		if (RSTRING_LEN(spat) == 1 && RSTRING_PTR(spat)[0] == ' ') {
-		    split_type = awk;
-		}
-	    }
-	    else {
-		int l;
-		if (rb_enc_ascget(RSTRING_PTR(spat), RSTRING_END(spat), &l, enc2) == ' ' &&
-		    RSTRING_LEN(spat) == l) {
-		    split_type = awk;
-		}
-	    }
+            split_type = literal_split_pattern(spat, SPLIT_TYPE_STRING);
+            break;
+
+          default:
+            UNREACHABLE_RETURN(Qnil);
 	}
     }
 
@@ -7999,7 +8104,7 @@ rb_str_split_m(int argc, VALUE *argv, VALUE str)
     beg = 0;
     char *ptr = RSTRING_PTR(str);
     char *eptr = RSTRING_END(str);
-    if (split_type == awk) {
+    if (split_type == SPLIT_TYPE_AWK) {
 	char *bptr = ptr;
 	int skip = 1;
 	unsigned int c;
@@ -8057,7 +8162,7 @@ rb_str_split_m(int argc, VALUE *argv, VALUE str)
 	    }
 	}
     }
-    else if (split_type == string) {
+    else if (split_type == SPLIT_TYPE_STRING) {
 	char *str_start = ptr;
 	char *substr_start = ptr;
 	char *sptr = RSTRING_PTR(spat);
@@ -8080,7 +8185,7 @@ rb_str_split_m(int argc, VALUE *argv, VALUE str)
 	}
 	beg = ptr - str_start;
     }
-    else if (split_type == chars) {
+    else if (split_type == SPLIT_TYPE_CHARS) {
         char *str_start = ptr;
         int n;
 
@@ -8102,11 +8207,12 @@ rb_str_split_m(int argc, VALUE *argv, VALUE str)
 	struct re_registers *regs;
         VALUE match = 0;
 
-        for (; (end = rb_reg_search(spat, str, start, 0)) >= 0;
+        for (; rb_reg_search(spat, str, start, 0) >= 0;
              (match ? (rb_match_unbusy(match), rb_backref_set(match)) : (void)0)) {
             match = rb_backref_get();
             if (!result) rb_match_busy(match);
             regs = RMATCH_REGS(match);
+            end = BEG(0);
 	    if (start == end && BEG(0) == END(0)) {
 		if (!ptr) {
 		    SPLIT_STR(0, 0);
@@ -8185,6 +8291,21 @@ chomp_newline(const char *p, const char *e, rb_encoding *enc)
     }
     return e;
 }
+
+static VALUE
+get_rs(void)
+{
+    VALUE rs = rb_rs;
+    if (!NIL_P(rs) &&
+	(!RB_TYPE_P(rs, T_STRING) ||
+	 RSTRING_LEN(rs) != 1 ||
+	 RSTRING_PTR(rs)[0] != '\n')) {
+        rb_warn("$/ is set to non-default value");
+    }
+    return rs;
+}
+
+#define rb_rs get_rs()
 
 static VALUE
 rb_str_enumerate_lines(int argc, VALUE *argv, VALUE str, VALUE ary)
@@ -8323,8 +8444,8 @@ rb_str_enumerate_lines(int argc, VALUE *argv, VALUE str, VALUE ary)
 
 /*
  *  call-seq:
- *     str.each_line(separator=$/ [, getline_args]) {|substr| block } -> str
- *     str.each_line(separator=$/ [, getline_args])                   -> an_enumerator
+ *     str.each_line(separator=$/, chomp: false) {|substr| block } -> str
+ *     str.each_line(separator=$/, chomp: false)                   -> an_enumerator
  *
  *  Splits <i>str</i> using the supplied parameter as the record
  *  separator (<code>$/</code> by default), passing each substring in
@@ -8332,30 +8453,40 @@ rb_str_enumerate_lines(int argc, VALUE *argv, VALUE str, VALUE ary)
  *  supplied, the string is split into paragraphs delimited by
  *  multiple successive newlines.
  *
- *  See IO.readlines for details about getline_args.
+ *  If +chomp+ is +true+, +separator+ will be removed from the end of each
+ *  line.
  *
  *  If no block is given, an enumerator is returned instead.
  *
- *     print "Example one\n"
  *     "hello\nworld".each_line {|s| p s}
- *     print "Example two\n"
+ *     # prints:
+ *     #   "hello\n"
+ *     #   "world"
+ *
  *     "hello\nworld".each_line('l') {|s| p s}
- *     print "Example three\n"
+ *     # prints:
+ *     #   "hel"
+ *     #   "l"
+ *     #   "o\nworl"
+ *     #   "d"
+ *
  *     "hello\n\n\nworld".each_line('') {|s| p s}
+ *     # prints
+ *     #   "hello\n\n"
+ *     #   "world"
  *
- *  <em>produces:</em>
+ *     "hello\nworld".each_line(chomp: true) {|s| p s}
+ *     # prints:
+ *     #   "hello"
+ *     #   "world"
  *
- *     Example one
- *     "hello\n"
- *     "world"
- *     Example two
- *     "hel"
- *     "l"
- *     "o\nworl"
- *     "d"
- *     Example three
- *     "hello\n\n"
- *     "world"
+ *     "hello\nworld".each_line('l', chomp: true) {|s| p s}
+ *     # prints:
+ *     #   "he"
+ *     #   ""
+ *     #   "o\nwor"
+ *     #   "d"
+ *
  */
 
 static VALUE
@@ -8367,13 +8498,14 @@ rb_str_each_line(int argc, VALUE *argv, VALUE str)
 
 /*
  *  call-seq:
- *     str.lines(separator=$/ [, getline_args])  -> an_array
+ *     str.lines(separator=$/, chomp: false)  -> an_array
  *
  *  Returns an array of lines in <i>str</i> split using the supplied
  *  record separator (<code>$/</code> by default).  This is a
  *  shorthand for <code>str.each_line(separator, getline_args).to_a</code>.
  *
- *  See IO.readlines for details about getline_args.
+ *  If +chomp+ is +true+, +separator+ will be removed from the end of each
+ *  line.
  *
  *     "hello\nworld\n".lines              #=> ["hello\n", "world\n"]
  *     "hello  world".lines(' ')           #=> ["hello ", " ", "world"]
@@ -8821,6 +8953,37 @@ rb_str_chop(VALUE str)
     return rb_str_subseq(str, 0, chopped_length(str));
 }
 
+static long
+smart_chomp(VALUE str, const char *e, const char *p)
+{
+    rb_encoding *enc = rb_enc_get(str);
+    if (rb_enc_mbminlen(enc) > 1) {
+        const char *pp = rb_enc_left_char_head(p, e-rb_enc_mbminlen(enc), e, enc);
+        if (rb_enc_is_newline(pp, e, enc)) {
+            e = pp;
+        }
+        pp = e - rb_enc_mbminlen(enc);
+        if (pp >= p) {
+            pp = rb_enc_left_char_head(p, pp, e, enc);
+            if (rb_enc_ascget(pp, e, 0, enc) == '\r') {
+                e = pp;
+            }
+        }
+    }
+    else {
+        switch (*(e-1)) { /* not e[-1] to get rid of VC bug */
+          case '\n':
+            if (--e > p && *(e-1) == '\r') {
+                --e;
+            }
+            break;
+          case '\r':
+            --e;
+            break;
+        }
+    }
+    return e - p;
+}
 
 static long
 chompped_length(VALUE str, VALUE rs)
@@ -8835,34 +8998,7 @@ chompped_length(VALUE str, VALUE rs)
     if (len == 0) return 0;
     e = p + len;
     if (rs == rb_default_rs) {
-      smart_chomp:
-	enc = rb_enc_get(str);
-	if (rb_enc_mbminlen(enc) > 1) {
-	    pp = rb_enc_left_char_head(p, e-rb_enc_mbminlen(enc), e, enc);
-	    if (rb_enc_is_newline(pp, e, enc)) {
-		e = pp;
-	    }
-	    pp = e - rb_enc_mbminlen(enc);
-	    if (pp >= p) {
-		pp = rb_enc_left_char_head(p, pp, e, enc);
-		if (rb_enc_ascget(pp, e, 0, enc) == '\r') {
-		    e = pp;
-		}
-	    }
-	}
-	else {
-	    switch (*(e-1)) { /* not e[-1] to get rid of VC bug */
-	      case '\n':
-		if (--e > p && *(e-1) == '\r') {
-		    --e;
-		}
-		break;
-	      case '\r':
-		--e;
-		break;
-	    }
-	}
-	return e - p;
+        return smart_chomp(str, e, p);
     }
 
     enc = rb_enc_get(str);
@@ -8898,11 +9034,11 @@ chompped_length(VALUE str, VALUE rs)
     if (rslen == rb_enc_mbminlen(enc)) {
 	if (rslen == 1) {
 	    if (newline == '\n')
-		goto smart_chomp;
+                return smart_chomp(str, e, p);
 	}
 	else {
 	    if (rb_enc_is_newline(rsptr, rsptr+rslen, enc))
-		goto smart_chomp;
+                return smart_chomp(str, e, p);
 	}
     }
 
@@ -9293,7 +9429,6 @@ scan_once(VALUE str, VALUE pat, long *start, int set_backref_str)
 	}
 	if (!regs || regs->num_regs == 1) {
 	    result = rb_str_subseq(str, pos, end - pos);
-	    OBJ_INFECT(result, pat);
 	    return result;
 	}
 	result = rb_ary_new2(regs->num_regs);
@@ -9301,7 +9436,6 @@ scan_once(VALUE str, VALUE pat, long *start, int set_backref_str)
 	    VALUE s = Qnil;
 	    if (BEG(i) >= 0) {
 		s = rb_str_subseq(str, BEG(i), END(i)-BEG(i));
-		OBJ_INFECT(s, pat);
 	    }
 	    rb_ary_push(result, s);
 	}
@@ -9504,8 +9638,7 @@ rb_str_crypt(VALUE str, VALUE salt)
     mustnot_wchar(str);
     mustnot_wchar(salt);
     if (RSTRING_LEN(salt) < 2) {
-      short_salt:
-	rb_raise(rb_eArgError, "salt too short (need >=2 bytes)");
+        goto short_salt;
     }
 
     s = StringValueCStr(str);
@@ -9535,8 +9668,11 @@ rb_str_crypt(VALUE str, VALUE salt)
     }
     result = rb_str_new_cstr(res);
     CRYPT_END();
-    FL_SET_RAW(result, OBJ_TAINTED_RAW(str) | OBJ_TAINTED_RAW(salt));
     return result;
+
+  short_salt:
+    rb_raise(rb_eArgError, "salt too short (need >=2 bytes)");
+    UNREACHABLE_RETURN(Qundef);
 }
 
 
@@ -9549,7 +9685,7 @@ rb_str_crypt(VALUE str, VALUE salt)
  *     "a".ord         #=> 97
  */
 
-VALUE
+static VALUE
 rb_str_ord(VALUE s)
 {
     unsigned int c;
@@ -9703,8 +9839,6 @@ rb_str_justify(int argc, VALUE *argv, VALUE str, char jflag)
     }
     TERM_FILL(p, termlen);
     STR_SET_LEN(res, p-RSTRING_PTR(res));
-    OBJ_INFECT_RAW(res, str);
-    if (!NIL_P(pad)) OBJ_INFECT_RAW(res, pad);
     rb_enc_associate(res, enc);
     if (argc == 2)
 	cr = ENC_CODERANGE_AND(cr, ENC_CODERANGE(pad));
@@ -9797,13 +9931,14 @@ rb_str_partition(VALUE str, VALUE sep)
 
     sep = get_pat_quoted(sep, 0);
     if (RB_TYPE_P(sep, T_REGEXP)) {
-	pos = rb_reg_search(sep, str, 0, 0);
-	if (pos < 0) {
-	  failed:
-	    return rb_ary_new3(3, rb_str_dup(str), str_new_empty(str), str_new_empty(str));
+	if (rb_reg_search(sep, str, 0, 0) < 0) {
+            goto failed;
 	}
-	sep = rb_str_subpat(str, sep, INT2FIX(0));
-	if (pos == 0 && RSTRING_LEN(sep) == 0) goto failed;
+	VALUE match = rb_backref_get();
+	struct re_registers *regs = RMATCH_REGS(match);
+
+        pos = BEG(0);
+	sep = rb_str_subseq(str, pos, END(0) - pos);
     }
     else {
 	pos = rb_str_index(str, sep, 0);
@@ -9813,6 +9948,9 @@ rb_str_partition(VALUE str, VALUE sep)
 		          sep,
 		          rb_str_subseq(str, pos+RSTRING_LEN(sep),
 					     RSTRING_LEN(str)-pos-RSTRING_LEN(sep)));
+
+  failed:
+    return rb_ary_new3(3, rb_str_dup(str), str_new_empty(str), str_new_empty(str));
 }
 
 /*
@@ -9834,37 +9972,33 @@ static VALUE
 rb_str_rpartition(VALUE str, VALUE sep)
 {
     long pos = RSTRING_LEN(str);
-    int regex = FALSE;
 
+    sep = get_pat_quoted(sep, 0);
     if (RB_TYPE_P(sep, T_REGEXP)) {
-	pos = rb_reg_search(sep, str, pos, 1);
-	regex = TRUE;
+        if (rb_reg_search(sep, str, pos, 1) < 0) {
+            goto failed;
+        }
+        VALUE match = rb_backref_get();
+	struct re_registers *regs = RMATCH_REGS(match);
+
+        pos = BEG(0);
+        sep = rb_str_subseq(str, pos, END(0) - pos);
     }
     else {
-	VALUE tmp;
-
-	tmp = rb_check_string_type(sep);
-	if (NIL_P(tmp)) {
-	    rb_raise(rb_eTypeError, "type mismatch: %s given",
-		     rb_obj_classname(sep));
-	}
-	sep = tmp;
 	pos = rb_str_sublen(str, pos);
 	pos = rb_str_rindex(str, sep, pos);
+        if(pos < 0) {
+            goto failed;
+        }
+        pos = rb_str_offset(str, pos);
     }
-    if (pos < 0) {
-       return rb_ary_new3(3, str_new_empty(str), str_new_empty(str), rb_str_dup(str));
-    }
-    if (regex) {
-	sep = rb_reg_nth_match(0, rb_backref_get());
-    }
-    else {
-	pos = rb_str_offset(str, pos);
-    }
+
     return rb_ary_new3(3, rb_str_subseq(str, 0, pos),
 		          sep,
 		          rb_str_subseq(str, pos+RSTRING_LEN(sep),
 					RSTRING_LEN(str)-pos-RSTRING_LEN(sep)));
+  failed:
+    return rb_ary_new3(3, str_new_empty(str), str_new_empty(str), rb_str_dup(str));
 }
 
 /*
@@ -10120,7 +10254,7 @@ rb_fs_setter(VALUE val, ID id, VALUE *var)
 		 rb_id2str(id));
     }
     if (!NIL_P(val)) {
-        rb_warn("non-nil $; will be deprecated");
+        rb_warn_deprecated("`$;'", NULL);
     }
     *var = val;
 }
@@ -10154,7 +10288,6 @@ rb_str_b(VALUE str)
 {
     VALUE str2 = str_alloc(rb_cString);
     str_replace_shared_without_enc(str2, str);
-    OBJ_INFECT_RAW(str2, str);
     ENC_CODERANGE_CLEAR(str2);
     return str2;
 }
@@ -10299,7 +10432,6 @@ enc_str_scrub(rb_encoding *enc, VALUE str, VALUE repl, int cr)
     VALUE buf = Qnil;
     const char *rep, *p, *e, *p1, *sp;
     long replen = -1;
-    int tainted = 0;
     long slen;
 
     if (rb_block_given_p()) {
@@ -10313,7 +10445,6 @@ enc_str_scrub(rb_encoding *enc, VALUE str, VALUE repl, int cr)
 
     if (!NIL_P(repl)) {
 	repl = str_compat_and_valid(repl, enc);
-	tainted = OBJ_TAINTED_RAW(repl);
     }
 
     if (rb_enc_dummy_p(enc)) {
@@ -10399,7 +10530,6 @@ enc_str_scrub(rb_encoding *enc, VALUE str, VALUE repl, int cr)
 		    repl = rb_yield(rb_enc_str_new(p, clen, enc));
                     str_mod_check(str, sp, slen);
 		    repl = str_compat_and_valid(repl, enc);
-		    tainted |= OBJ_TAINTED_RAW(repl);
 		    rb_str_buf_cat(buf, RSTRING_PTR(repl), RSTRING_LEN(repl));
 		    if (ENC_CODERANGE(repl) == ENC_CODERANGE_VALID)
 			cr = ENC_CODERANGE_VALID;
@@ -10435,7 +10565,6 @@ enc_str_scrub(rb_encoding *enc, VALUE str, VALUE repl, int cr)
 		repl = rb_yield(rb_enc_str_new(p, e-p, enc));
                 str_mod_check(str, sp, slen);
 		repl = str_compat_and_valid(repl, enc);
-		tainted |= OBJ_TAINTED_RAW(repl);
 		rb_str_buf_cat(buf, RSTRING_PTR(repl), RSTRING_LEN(repl));
 		if (ENC_CODERANGE(repl) == ENC_CODERANGE_VALID)
 		    cr = ENC_CODERANGE_VALID;
@@ -10502,7 +10631,6 @@ enc_str_scrub(rb_encoding *enc, VALUE str, VALUE repl, int cr)
 		    repl = rb_yield(rb_enc_str_new(p, clen, enc));
                     str_mod_check(str, sp, slen);
 		    repl = str_compat_and_valid(repl, enc);
-		    tainted |= OBJ_TAINTED_RAW(repl);
 		    rb_str_buf_cat(buf, RSTRING_PTR(repl), RSTRING_LEN(repl));
 		}
 		p += clen;
@@ -10530,13 +10658,11 @@ enc_str_scrub(rb_encoding *enc, VALUE str, VALUE repl, int cr)
 		repl = rb_yield(rb_enc_str_new(p, e-p, enc));
                 str_mod_check(str, sp, slen);
 		repl = str_compat_and_valid(repl, enc);
-		tainted |= OBJ_TAINTED_RAW(repl);
 		rb_str_buf_cat(buf, RSTRING_PTR(repl), RSTRING_LEN(repl));
 	    }
 	}
 	cr = ENC_CODERANGE_VALID;
     }
-    FL_SET_RAW(buf, tainted|OBJ_TAINTED_RAW(str));
     ENCODING_CODERANGE_SET(buf, rb_enc_to_index(enc), cr);
     return buf;
 }
@@ -10849,7 +10975,7 @@ sym_to_sym(VALUE sym)
 }
 
 MJIT_FUNC_EXPORTED VALUE
-rb_sym_proc_call(ID mid, int argc, const VALUE *argv, VALUE passed_proc)
+rb_sym_proc_call(ID mid, int argc, const VALUE *argv, int kw_splat, VALUE passed_proc)
 {
     VALUE obj;
 
@@ -10857,7 +10983,7 @@ rb_sym_proc_call(ID mid, int argc, const VALUE *argv, VALUE passed_proc)
 	rb_raise(rb_eArgError, "no receiver given");
     }
     obj = argv[0];
-    return rb_funcall_with_block(obj, mid, argc - 1, argv + 1, passed_proc);
+    return rb_funcall_with_block_kw(obj, mid, argc - 1, argv + 1, passed_proc, kw_splat);
 }
 
 #if 0
@@ -11112,6 +11238,46 @@ sym_swapcase(int argc, VALUE *argv, VALUE sym)
 }
 
 /*
+ *  call-seq:
+ *     sym.start_with?([prefixes]+)   -> true or false
+ *
+ *  Returns true if +sym+ starts with one of the +prefixes+ given.
+ *  Each of the +prefixes+ should be a String or a Regexp.
+ *
+ *    :hello.start_with?("hell")               #=> true
+ *    :hello.start_with?(/H/i)                 #=> true
+ *
+ *    # returns true if one of the prefixes matches.
+ *    :hello.start_with?("heaven", "hell")     #=> true
+ *    :hello.start_with?("heaven", "paradise") #=> false
+ */
+
+static VALUE
+sym_start_with(int argc, VALUE *argv, VALUE sym)
+{
+    return rb_str_start_with(argc, argv, rb_sym2str(sym));
+}
+
+/*
+ *  call-seq:
+ *     sym.end_with?([suffixes]+)   -> true or false
+ *
+ *  Returns true if +sym+ ends with one of the +suffixes+ given.
+ *
+ *    :hello.end_with?("ello")               #=> true
+ *
+ *    # returns true if one of the +suffixes+ matches.
+ *    :hello.end_with?("heaven", "ello")     #=> true
+ *    :hello.end_with?("heaven", "paradise") #=> false
+ */
+
+static VALUE
+sym_end_with(int argc, VALUE *argv, VALUE sym)
+{
+    return rb_str_end_with(argc, argv, rb_sym2str(sym));
+}
+
+/*
  * call-seq:
  *   sym.encoding   -> encoding
  *
@@ -11156,6 +11322,28 @@ rb_to_symbol(VALUE name)
     }
     name = string_for_symbol(name);
     return rb_str_intern(name);
+}
+
+/*
+ *  call-seq:
+ *     Symbol.all_symbols    => array
+ *
+ *  Returns an array of all the symbols currently in Ruby's symbol
+ *  table.
+ *
+ *     Symbol.all_symbols.size    #=> 903
+ *     Symbol.all_symbols[1,20]   #=> [:floor, :ARGV, :Binding, :symlink,
+ *                                     :chown, :EOFError, :$;, :String,
+ *                                     :LOCK_SH, :"setuid?", :$<,
+ *                                     :default_proc, :compact, :extend,
+ *                                     :Tms, :getwd, :$=, :ThreadGroup,
+ *                                     :wait2, :$>]
+ */
+
+static VALUE
+sym_all_symbols(VALUE _)
+{
+    return rb_sym_all_symbols();
 }
 
 /*
@@ -11344,7 +11532,7 @@ Init_String(void)
     rb_include_module(rb_cSymbol, rb_mComparable);
     rb_undef_alloc_func(rb_cSymbol);
     rb_undef_method(CLASS_OF(rb_cSymbol), "new");
-    rb_define_singleton_method(rb_cSymbol, "all_symbols", rb_sym_all_symbols, 0); /* in symbol.c */
+    rb_define_singleton_method(rb_cSymbol, "all_symbols", sym_all_symbols, 0);
 
     rb_define_method(rb_cSymbol, "==", sym_equal, 1);
     rb_define_method(rb_cSymbol, "===", sym_equal, 1);
@@ -11374,6 +11562,9 @@ Init_String(void)
     rb_define_method(rb_cSymbol, "downcase", sym_downcase, -1);
     rb_define_method(rb_cSymbol, "capitalize", sym_capitalize, -1);
     rb_define_method(rb_cSymbol, "swapcase", sym_swapcase, -1);
+
+    rb_define_method(rb_cSymbol, "start_with?", sym_start_with, -1);
+    rb_define_method(rb_cSymbol, "end_with?", sym_end_with, -1);
 
     rb_define_method(rb_cSymbol, "encoding", sym_encoding, 0);
 }

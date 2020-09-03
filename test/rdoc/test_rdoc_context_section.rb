@@ -1,5 +1,5 @@
 # frozen_string_literal: true
-require 'minitest_helper'
+require_relative 'helper'
 
 class TestRDocContextSection < RDoc::TestCase
 
@@ -141,14 +141,6 @@ class TestRDocContextSection < RDoc::TestCase
     loaded.remove_comment comment('bogus', @top_level)
 
     assert_equal doc(other_comment.parse), loaded.comments
-  end
-
-  def test_sequence
-    _, err = verbose_capture_io do
-      assert_match(/\ASEC\d{5}\Z/, @s.sequence)
-    end
-
-    assert_equal "#{@S}#sequence is deprecated, use #aref\n", err
   end
 
 end

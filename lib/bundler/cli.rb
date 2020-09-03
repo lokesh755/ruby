@@ -9,15 +9,19 @@ module Bundler
     package_name "Bundler"
 
     AUTO_INSTALL_CMDS = %w[show binstubs outdated exec open console licenses clean].freeze
-    PARSEABLE_COMMANDS = %w[
-      check config help exec platform show version
-    ].freeze
+    PARSEABLE_COMMANDS = %w[check config help exec platform show version].freeze
+
+    COMMAND_ALIASES = {
+      "check" => "c",
+      "install" => "i",
+      "list" => "ls",
+      "exec" => ["e", "ex", "exe"],
+      "cache" => ["package", "pack"],
+      "version" => ["-v", "--version"],
+    }.freeze
 
     def self.start(*)
       super
-    rescue Exception => e # rubocop:disable Lint/RescueException
-      Bundler.ui = UI::Shell.new
-      raise e
     ensure
       Bundler::SharedHelpers.print_major_deprecations!
     end
@@ -27,6 +31,24 @@ module Bundler
         i.send(:print_command)
         i.send(:warn_on_outdated_bundler)
       end
+    end
+
+    def self.all_aliases
+      @all_aliases ||= begin
+                         command_aliases = {}
+
+                         COMMAND_ALIASES.each do |name, aliases|
+                           Array(aliases).each do |one_alias|
+                             command_aliases[one_alias] = name
+                           end
+                         end
+
+                         command_aliases
+                       end
+    end
+
+    def self.aliases_for(command_name)
+      COMMAND_ALIASES.select {|k, _| k == command_name }.invert
     end
 
     def initialize(*args)
@@ -68,9 +90,7 @@ module Bundler
       version
       Bundler.ui.info "\n"
 
-      primary_commands = ["install", "update",
-                          Bundler.feature_flag.bundler_3_mode? ? "cache" : "package",
-                          "exec", "config", "help"]
+      primary_commands = ["install", "update", "cache", "exec", "config", "help"]
 
       list = self.class.printable_commands(true)
       by_name = list.group_by {|name, _message| name.match(/^bundle (\w+)/)[1] }
@@ -102,16 +122,19 @@ module Bundler
       else command = "bundle-#{cli}"
       end
 
-      man_path  = File.expand_path("../../../man", __FILE__)
-      man_pages = Hash[Dir.glob(File.join(man_path, "*")).grep(/.*\.\d*\Z/).collect do |f|
+      man_path = File.expand_path("../../../man", __FILE__)
+      # man files are located under ruby's mandir with the default gems of bundler
+      man_path = RbConfig::CONFIG["mandir"] unless File.directory?(man_path)
+      man_pages = Hash[Dir.glob(File.join(man_path, "**", "*")).grep(/.*\.\d*\Z/).collect do |f|
         [File.basename(f, ".*"), f]
       end]
 
       if man_pages.include?(command)
+        man_page = man_pages[command]
         if Bundler.which("man") && man_path !~ %r{^file:/.+!/META-INF/jruby.home/.+}
-          Kernel.exec "man #{man_pages[command]}"
+          Kernel.exec "man #{man_page}"
         else
-          puts File.read("#{man_path}/#{File.basename(man_pages[command])}.txt")
+          puts File.read("#{File.dirname(man_page)}/#{File.basename(man_page)}.txt")
         end
       elsif command_path = Bundler.which("bundler-#{cli}")
         Kernel.exec(command_path, "--help")
@@ -154,11 +177,14 @@ module Bundler
       "Use the specified gemfile instead of Gemfile"
     method_option "path", :type => :string, :banner =>
       "Specify a different path than the system default ($BUNDLE_PATH or $GEM_HOME).#{" Bundler will remember this value for future installs on this machine" unless Bundler.feature_flag.forget_cli_options?}"
-    map "c" => "check"
     def check
+      remembered_flag_deprecation("path")
+
       require_relative "cli/check"
       Check.new(options).run
     end
+
+    map aliases_for("check")
 
     desc "remove [GEM [GEM ...]]", "Removes gems from the Gemfile"
     long_desc <<-D
@@ -205,7 +231,7 @@ module Bundler
     method_option "no-prune", :type => :boolean, :banner =>
       "Don't remove stale gems from the cache."
     method_option "path", :type => :string, :banner =>
-      "Specify a different path than the system default ($BUNDLE_PATH or $GEM_HOME). Bundler will remember this value for future installs on this machine"
+      "Specify a different path than the system default ($BUNDLE_PATH or $GEM_HOME).#{" Bundler will remember this value for future installs on this machine" unless Bundler.feature_flag.forget_cli_options?}"
     method_option "quiet", :type => :boolean, :banner =>
       "Only output warnings and errors."
     method_option "shebang", :type => :string, :banner =>
@@ -221,19 +247,22 @@ module Bundler
       "Exclude gems that are part of the specified named group."
     method_option "with", :type => :array, :banner =>
       "Include gems that are part of the specified named group."
-    map "i" => "install"
     def install
       SharedHelpers.major_deprecation(2, "The `--force` option has been renamed to `--redownload`") if ARGV.include?("--force")
 
-      %w[clean deployment frozen no-cache no-prune path shebang system without with].each do |option|
+      %w[clean deployment frozen no-prune path shebang system without with].each do |option|
         remembered_flag_deprecation(option)
       end
+
+      remembered_negative_flag_deprecation("no-deployment")
 
       require_relative "cli/install"
       Bundler.settings.temporary(:no_install => false) do
         Install.new(options.dup).run
       end
     end
+
+    map aliases_for("install")
 
     desc "update [OPTIONS]", "Update the current environment"
     long_desc <<-D
@@ -318,15 +347,15 @@ module Bundler
 
     desc "list", "List all gems in the bundle"
     method_option "name-only", :type => :boolean, :banner => "print only the gem names"
-    method_option "only-group", :type => :string, :banner => "print gems from a particular group"
-    method_option "without-group", :type => :string, :banner => "print all gems except from a group"
+    method_option "only-group", :type => :array, :default => [], :banner => "print gems from a given set of groups"
+    method_option "without-group", :type => :array, :default => [], :banner => "print all gems except from a given set of groups"
     method_option "paths", :type => :boolean, :banner => "print the path to each gem in the bundle"
     def list
       require_relative "cli/list"
       List.new(options).run
     end
 
-    map %w[ls] => "list"
+    map aliases_for("list")
 
     desc "info GEM [OPTIONS]", "Show information for the given gem"
     method_option "path", :type => :boolean, :banner => "Print full path to gem"
@@ -410,7 +439,7 @@ module Bundler
       Outdated.new(options, gems).run
     end
 
-    desc "#{Bundler.feature_flag.bundler_3_mode? ? :cache : :package} [OPTIONS]", "Locks and then caches all of the gems into vendor/cache"
+    desc "cache [OPTIONS]", "Locks and then caches all of the gems into vendor/cache"
     unless Bundler.feature_flag.cache_all?
       method_option "all",  :type => :boolean,
                             :banner => "Include all sources (including path and git)."
@@ -419,24 +448,25 @@ module Bundler
     method_option "cache-path", :type => :string, :banner =>
       "Specify a different cache path than the default (vendor/cache)."
     method_option "gemfile", :type => :string, :banner => "Use the specified gemfile instead of Gemfile"
-    method_option "no-install", :type => :boolean, :banner => "Don't install the gems, only the package."
+    method_option "no-install", :type => :boolean, :banner => "Don't install the gems, only update the cache."
     method_option "no-prune", :type => :boolean, :banner => "Don't remove stale gems from the cache."
     method_option "path", :type => :string, :banner =>
-      "Specify a different path than the system default ($BUNDLE_PATH or $GEM_HOME). Bundler will remember this value for future installs on this machine"
+      "Specify a different path than the system default ($BUNDLE_PATH or $GEM_HOME).#{" Bundler will remember this value for future installs on this machine" unless Bundler.feature_flag.forget_cli_options?}"
     method_option "quiet", :type => :boolean, :banner => "Only output warnings and errors."
     method_option "frozen", :type => :boolean, :banner =>
-      "Do not allow the Gemfile.lock to be updated after this package operation's install"
+      "Do not allow the Gemfile.lock to be updated after this bundle cache operation's install"
     long_desc <<-D
-      The package command will copy the .gem files for every gem in the bundle into the
+      The cache command will copy the .gem files for every gem in the bundle into the
       directory ./vendor/cache. If you then check that directory into your source
       control repository, others who check out your source will be able to install the
       bundle without having to download any additional gems.
     D
-    def package
-      require_relative "cli/package"
-      Package.new(options).run
+    def cache
+      require_relative "cli/cache"
+      Cache.new(options).run
     end
-    map %w[cache pack] => :package
+
+    map aliases_for("cache")
 
     desc "exec [OPTIONS]", "Run the command in context of the bundle"
     method_option :keep_file_descriptors, :type => :boolean, :default => false
@@ -446,11 +476,12 @@ module Bundler
       bundle exec you can require and call the bundled gems as if they were installed
       into the system wide RubyGems repository.
     D
-    map "e" => "exec"
     def exec(*args)
       require_relative "cli/exec"
       Exec.new(options, args).run
     end
+
+    map aliases_for("exec")
 
     desc "config NAME [VALUE]", "Retrieve or set a configuration value"
     long_desc <<-D
@@ -494,7 +525,8 @@ module Bundler
         Bundler.ui.info "Bundler version #{Bundler::VERSION}#{build_info}"
       end
     end
-    map %w[-v --version] => :version
+
+    map aliases_for("version")
 
     desc "licenses", "Prints the license of all gems in the bundle"
     def licenses
@@ -538,9 +570,14 @@ module Bundler
                          :lazy_default => [ENV["BUNDLER_EDITOR"], ENV["VISUAL"], ENV["EDITOR"]].find {|e| !e.nil? && !e.empty? },
                          :desc => "Open generated gemspec in the specified editor (defaults to $EDITOR or $BUNDLER_EDITOR)"
     method_option :ext, :type => :boolean, :default => false, :desc => "Generate the boilerplate for C extension code"
+    method_option :git, :type => :boolean, :default => true, :desc => "Initialize a git repo inside your library."
     method_option :mit, :type => :boolean, :desc => "Generate an MIT license file. Set a default with `bundle config set gem.mit true`."
-    method_option :test, :type => :string, :lazy_default => "rspec", :aliases => "-t", :banner => "rspec",
-                         :desc => "Generate a test directory for your library, either rspec or minitest. Set a default with `bundle config set gem.test rspec`."
+    method_option :rubocop, :type => :boolean, :desc => "Add rubocop to the generated Rakefile and gemspec. Set a default with `bundle config set gem.rubocop true`."
+    method_option :test, :type => :string, :lazy_default => Bundler.settings["gem.test"] || "", :aliases => "-t", :banner => "Use the specified test framework for your library",
+                         :desc => "Generate a test directory for your library, either rspec, minitest or test-unit. Set a default with `bundle config set gem.test (rspec|minitest|test-unit)`."
+    method_option :ci, :type => :string, :lazy_default => Bundler.settings["gem.ci"] || "",
+                       :desc => "Generate CI configuration, either GitHub Actions, Travis CI, GitLab CI or CircleCI. Set a default with `bundle config set gem.ci (github|travis|gitlab|circle)`"
+
     def gem(name)
     end
 
@@ -677,12 +714,17 @@ module Bundler
     # Reformat the arguments passed to bundle that include a --help flag
     # into the corresponding `bundle help #{command}` call
     def self.reformatted_help_args(args)
-      bundler_commands = all_commands.keys
+      bundler_commands = (COMMAND_ALIASES.keys + COMMAND_ALIASES.values).flatten
+
       help_flags = %w[--help -h]
-      exec_commands = %w[e ex exe exec]
+      exec_commands = ["exec"] + COMMAND_ALIASES["exec"]
+
       help_used = args.index {|a| help_flags.include? a }
       exec_used = args.index {|a| exec_commands.include? a }
+
       command = args.find {|a| bundler_commands.include? a }
+      command = all_aliases[command] if all_aliases[command]
+
       if exec_used && help_used
         if exec_used + help_used == 1
           %w[help exec]
@@ -750,7 +792,7 @@ module Bundler
       return unless SharedHelpers.md5_available?
 
       latest = Fetcher::CompactIndex.
-               new(nil, Source::Rubygems::Remote.new(URI("https://rubygems.org")), nil).
+               new(nil, Source::Rubygems::Remote.new(Bundler::URI("https://rubygems.org")), nil).
                send(:compact_index_client).
                instance_variable_get(:@cache).
                dependencies("bundler").
@@ -775,11 +817,23 @@ module Bundler
       nil
     end
 
+    def remembered_negative_flag_deprecation(name)
+      positive_name = name.gsub(/\Ano-/, "")
+      option = current_command.options[positive_name]
+      flag_name = "--no-" + option.switch_name.gsub(/\A--/, "")
+
+      flag_deprecation(positive_name, flag_name, option)
+    end
+
     def remembered_flag_deprecation(name)
       option = current_command.options[name]
       flag_name = option.switch_name
 
-      name_index = ARGV.find {|arg| flag_name == arg }
+      flag_deprecation(name, flag_name, option)
+    end
+
+    def flag_deprecation(name, flag_name, option)
+      name_index = ARGV.find {|arg| flag_name == arg.split("=")[0] }
       return unless name_index
 
       value = options[name]
@@ -787,8 +841,8 @@ module Bundler
 
       Bundler::SharedHelpers.major_deprecation 2,\
         "The `#{flag_name}` flag is deprecated because it relies on being " \
-        "remembered accross bundler invokations, which bundler will no longer " \
-        "do in future versions. Instead please use `bundle config #{name} " \
+        "remembered across bundler invocations, which bundler will no longer " \
+        "do in future versions. Instead please use `bundle config set #{name.tr("-", "_")} " \
         "'#{value}'`, and stop using this flag"
     end
   end

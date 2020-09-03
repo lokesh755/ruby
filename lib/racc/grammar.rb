@@ -1,11 +1,14 @@
+#--
 #
-# $Id: acc33b7e1fe05f28f2d271f1fb9f1c42e50705dc $
+#
 #
 # Copyright (c) 1999-2006 Minero Aoki
 #
 # This program is free software.
 # You can distribute/modify this program under the same terms of ruby.
 # see the file "COPYING".
+#
+#++
 
 require 'racc/compat'
 require 'racc/iset'

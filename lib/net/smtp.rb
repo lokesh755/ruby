@@ -17,7 +17,7 @@
 # See Net::SMTP for documentation.
 #
 
-require_relative 'protocol'
+require 'net/protocol'
 require 'digest/md5'
 require 'timeout'
 begin
@@ -168,6 +168,7 @@ module Net
   #                     'Your Account', 'Your Password', :cram_md5)
   #
   class SMTP < Protocol
+    VERSION = "0.1.0"
 
     Revision = %q$Revision$.split[1]
 
@@ -831,9 +832,6 @@ module Net
     end
 
     def mailfrom(from_addr)
-      if $SAFE > 0
-        raise SecurityError, 'tainted from_addr' if from_addr.tainted?
-      end
       getok("MAIL FROM:<#{from_addr}>")
     end
 
@@ -859,9 +857,6 @@ module Net
     end
 
     def rcptto(to_addr)
-      if $SAFE > 0
-        raise SecurityError, 'tainted to_addr' if to_addr.tainted?
-      end
       getok("RCPT TO:<#{to_addr}>")
     end
 
@@ -1048,7 +1043,7 @@ module Net
         return {} unless @string[3, 1] == '-'
         h = {}
         @string.lines.drop(1).each do |line|
-          k, *v = line[4..-1].chomp.split
+          k, *v = line[4..-1].split(' ')
           h[k] = v
         end
         h

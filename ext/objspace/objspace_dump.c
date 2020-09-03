@@ -12,13 +12,15 @@
 
 **********************************************************************/
 
-#include "ruby/io.h"
-#include "internal.h"
-#include "ruby/debug.h"
 #include "gc.h"
+#include "internal.h"
+#include "internal/hash.h"
+#include "internal/string.h"
 #include "node.h"
-#include "vm_core.h"
 #include "objspace.h"
+#include "ruby/debug.h"
+#include "ruby/io.h"
+#include "vm_core.h"
 
 static VALUE sym_output, sym_stdout, sym_string, sym_file;
 static VALUE sym_full;
@@ -83,9 +85,12 @@ dump_append_string_value(struct dump_config *dc, VALUE obj)
 	  case '\r':
 	    dump_append(dc, "\\r");
 	    break;
+	  case '\177':
+	    dump_append(dc, "\\u007f");
+	    break;
 	  default:
 	    if (c <= 0x1f)
-		dump_append(dc, "\\u%04d", c);
+		dump_append(dc, "\\u%04x", c);
 	    else
 		dump_append(dc, "%c", c);
 	}
@@ -133,6 +138,7 @@ obj_type(VALUE obj)
 	CASE_TYPE(NODE);
 	CASE_TYPE(ZOMBIE);
 #undef CASE_TYPE
+      default: break;
     }
     return "UNKNOWN";
 }
@@ -192,28 +198,6 @@ dump_append_string_content(struct dump_config *dc, VALUE obj)
     }
 }
 
-static const char *
-imemo_name(int imemo)
-{
-    switch(imemo) {
-#define TYPE_STR(t) case(imemo_##t): return #t
-	TYPE_STR(env);
-	TYPE_STR(cref);
-	TYPE_STR(svar);
-	TYPE_STR(throw_data);
-	TYPE_STR(ifunc);
-	TYPE_STR(memo);
-	TYPE_STR(ment);
-	TYPE_STR(iseq);
-	TYPE_STR(tmpbuf);
-	TYPE_STR(ast);
-	TYPE_STR(parser_strterm);
-      default:
-	return "unknown";
-#undef TYPE_STR
-    }
-}
-
 static void
 dump_object(VALUE obj, struct dump_config *dc)
 {
@@ -248,7 +232,7 @@ dump_object(VALUE obj, struct dump_config *dc)
 	return;
 
       case T_IMEMO:
-	dump_append(dc, ", \"imemo_type\":\"%s\"", imemo_name(imemo_type(obj)));
+	dump_append(dc, ", \"imemo_type\":\"%s\"", rb_imemo_name(imemo_type(obj)));
 	break;
 
       case T_SYMBOL:
@@ -287,8 +271,11 @@ dump_object(VALUE obj, struct dump_config *dc)
 
       case T_CLASS:
       case T_MODULE:
-	if (dc->cur_obj_klass)
-	    dump_append(dc, ", \"name\":\"%s\"", rb_class2name(obj));
+	if (dc->cur_obj_klass) {
+	    VALUE mod_name = rb_mod_name(obj);
+	    if (!NIL_P(mod_name))
+		dump_append(dc, ", \"name\":\"%s\"", RSTRING_PTR(mod_name));
+	}
 	break;
 
       case T_DATA:
@@ -313,6 +300,9 @@ dump_object(VALUE obj, struct dump_config *dc)
       case T_ZOMBIE:
 	dump_append(dc, "}\n");
 	return;
+
+      default:
+        break;
     }
 
     rb_objspace_reachable_objects_from(obj, reachable_object_i, dc);
@@ -323,7 +313,8 @@ dump_object(VALUE obj, struct dump_config *dc)
 	dump_append(dc, ", \"file\":\"%s\", \"line\":%lu", ainfo->path, ainfo->line);
 	if (RTEST(ainfo->mid)) {
 	    VALUE m = rb_sym2str(ainfo->mid);
-	    dump_append(dc, ", \"method\":\"%s\"", RSTRING_PTR(m));
+	    dump_append(dc, ", \"method\":");
+	    dump_append_string_value(dc, m);
 	}
 	dump_append(dc, ", \"generation\":%"PRIuSIZE, ainfo->generation);
     }

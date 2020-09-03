@@ -11,48 +11,65 @@
 
 **********************************************************************/
 
-#ifdef __CYGWIN__
-#include <windows.h>
-#include <sys/cygwin.h>
-#endif
-#include "ruby/encoding.h"
-#include "ruby/thread.h"
-#include "ruby/version.h"
-#include "internal.h"
-#include "eval_intern.h"
-#include "dln.h"
+#include "ruby/internal/config.h"
+
+#include <ctype.h>
 #include <stdio.h>
 #include <sys/types.h>
-#include <ctype.h>
+
+#ifdef __CYGWIN__
+# include <windows.h>
+# include <sys/cygwin.h>
+#endif
 
 #ifdef __hpux
-#include <sys/pstat.h>
+# include <sys/pstat.h>
 #endif
+
 #if defined(LOAD_RELATIVE) && defined(HAVE_DLADDR)
-#include <dlfcn.h>
+# include <dlfcn.h>
 #endif
 
 #ifdef HAVE_UNISTD_H
-#include <unistd.h>
+# include <unistd.h>
 #endif
+
 #if defined(HAVE_FCNTL_H)
-#include <fcntl.h>
+# include <fcntl.h>
 #elif defined(HAVE_SYS_FCNTL_H)
-#include <sys/fcntl.h>
+# include <sys/fcntl.h>
 #endif
+
 #ifdef HAVE_SYS_PARAM_H
 # include <sys/param.h>
 #endif
+
+#include "dln.h"
+#include "eval_intern.h"
+#include "internal.h"
+#include "internal/error.h"
+#include "internal/file.h"
+#include "internal/inits.h"
+#include "internal/io.h"
+#include "internal/load.h"
+#include "internal/loadpath.h"
+#include "internal/missing.h"
+#include "internal/object.h"
+#include "internal/parse.h"
+#include "internal/process.h"
+#include "internal/variable.h"
+#include "mjit.h"
+#include "ruby/encoding.h"
+#include "ruby/thread.h"
+#include "ruby/util.h"
+#include "ruby/version.h"
+
 #ifndef MAXPATHLEN
 # define MAXPATHLEN 1024
 #endif
 #ifndef O_ACCMODE
 # define O_ACCMODE (O_RDONLY | O_WRONLY | O_RDWR)
 #endif
-
-#include "ruby/util.h"
-
-#include "mjit.h"
 
 void Init_ruby_description(void);
 
@@ -68,6 +85,8 @@ char *getenv();
 #else
 #define DEFAULT_RUBYGEMS_ENABLED "enabled"
 #endif
+
+void rb_warning_category_update(unsigned int mask, unsigned int bits);
 
 #define COMMA ,
 #define FEATURE_BIT(bit) (1U << feature_##bit)
@@ -144,6 +163,7 @@ rb_feature_set_to(ruby_features_t *feat, unsigned int bit_mask, unsigned int bit
 #define FEATURE_SET_TO(feat, bit_mask, bit_set) \
     rb_feature_set_to(&(feat), bit_mask, bit_set)
 #define FEATURE_SET(feat, bits) FEATURE_SET_TO(feat, bits, bits)
+#define FEATURE_SET_RESTORE(feat, save) FEATURE_SET_TO(feat, (save).mask, (save).set & (save).mask)
 #define FEATURE_SET_P(feat, bits) ((feat).set & (bits))
 
 struct ruby_cmdline_options {
@@ -158,11 +178,11 @@ struct ruby_cmdline_options {
     } src, ext, intern;
     VALUE req_list;
     ruby_features_t features;
+    ruby_features_t warn;
     unsigned int dump;
 #if USE_MJIT
     struct mjit_options mjit;
 #endif
-    int safe_level;
     int sflag, xflag;
     unsigned int warning: 1;
     unsigned int verbose: 1;
@@ -220,20 +240,26 @@ static struct {
     char **argv;
 } origarg;
 
+static const char esc_standout[] = "\n\033[1;7m";
+static const char esc_bold[] = "\033[1m";
+static const char esc_reset[] = "\033[0m";
+static const char esc_none[] = "";
+
 static void
-show_usage_line(const char *str, unsigned int namelen, unsigned int secondlen, int help)
+show_usage_line(const char *str, unsigned int namelen, unsigned int secondlen, int help, int highlight, unsigned int w)
 {
-    const unsigned int w = 16;
+    const char *sb = highlight ? esc_bold : esc_none;
+    const char *se = highlight ? esc_reset : esc_none;
     const int wrap = help && namelen + secondlen - 1 > w;
-    printf("  %.*s%-*.*s%-*s%s\n", namelen-1, str,
+    printf("  %s%.*s%-*.*s%s%-*s%s\n", sb, namelen-1, str,
 	   (wrap ? 0 : w - namelen + 1),
-	   (help ? secondlen-1 : 0), str + namelen,
+	   (help ? secondlen-1 : 0), str + namelen, se,
 	   (wrap ? w + 3 : 0), (wrap ? "\n" : ""),
 	   str + namelen + secondlen);
 }
 
 static void
-usage(const char *name, int help)
+usage(const char *name, int help, int highlight, int columns)
 {
     /* This message really ought to be max 23 lines.
      * Removed -h because the user already knows that option. Others? */
@@ -264,10 +290,9 @@ usage(const char *name, int help)
 	M("-rlibrary",	   "",			   "require the library before executing your script"),
 	M("-s",		   "",			   "enable some switch parsing for switches after script name"),
 	M("-S",		   "",			   "look for the script using PATH environment variable"),
-	M("-T[level=1]",   "",			   "turn on tainting checks"),
 	M("-v",		   "",			   "print the version number, then turn on verbose mode"),
 	M("-w",		   "",			   "turn warnings on for your script"),
-	M("-W[level=2]",   "",			   "set warning level; 0=silence, 1=medium, 2=verbose"),
+	M("-W[level=2|:category]",   "",	   "set warning level; 0=silence, 1=medium, 2=verbose"),
 	M("-x[directory]", "",			   "strip off text before #!ruby line and perhaps cd to directory"),
         M("--jit",         "",                     "enable JIT with default options (experimental)"),
         M("--jit-[option]","",                     "enable JIT with an option (experimental)"),
@@ -284,6 +309,7 @@ usage(const char *name, int help)
 	M("--verbose",                              "", "turn on verbose mode and disable script from stdin"),
 	M("--version",                              "", "print the version number, then exit"),
 	M("--help",			            "", "show this message, -h for short message"),
+	M("--backtrace-limit=num",                  "", "limit the maximum length of backtrace"),
     };
     static const struct message dumps[] = {
 	M("insns",                  "", "instruction sequences"),
@@ -298,34 +324,46 @@ usage(const char *name, int help)
 	M("frozen-string-literal", "", "freeze all string literals (default: disabled)"),
         M("jit", "",            "JIT compiler (default: disabled)"),
     };
+    static const struct message warn_categories[] = {
+        M("deprecated", "",       "deprecated features"),
+        M("experimental", "",     "experimental features"),
+    };
     static const struct message mjit_options[] = {
         M("--jit-warnings",      "", "Enable printing JIT warnings"),
-        M("--jit-debug",         "", "Enable JIT debugging (very slow)"),
-        M("--jit-wait",          "", "Wait until JIT compilation is finished everytime (for testing)"),
+        M("--jit-debug",         "", "Enable JIT debugging (very slow), or add cflags if specified"),
+        M("--jit-wait",          "", "Wait until JIT compilation finishes every time (for testing)"),
         M("--jit-save-temps",    "", "Save JIT temporary files in $TMP or /tmp (for testing)"),
         M("--jit-verbose=num",   "", "Print JIT logs of level num or less to stderr (default: 0)"),
         M("--jit-max-cache=num", "", "Max number of methods to be JIT-ed in a cache (default: 100)"),
         M("--jit-min-calls=num", "", "Number of calls to trigger JIT (for testing, default: 10000)"),
     };
     int i;
+    const char *sb = highlight ? esc_standout+1 : esc_none;
+    const char *se = highlight ? esc_reset : esc_none;
     const int num = numberof(usage_msg) - (help ? 1 : 0);
-#define SHOW(m) show_usage_line((m).str, (m).namelen, (m).secondlen, help)
+    unsigned int w = (columns > 80 ? (columns - 79) / 2 : 0) + 16;
+#define SHOW(m) show_usage_line((m).str, (m).namelen, (m).secondlen, help, highlight, w)
 
-    printf("Usage: %s [switches] [--] [programfile] [arguments]\n", name);
+    printf("%sUsage:%s %s [switches] [--] [programfile] [arguments]\n", sb, se, name);
     for (i = 0; i < num; ++i)
 	SHOW(usage_msg[i]);
 
     if (!help) return;
 
+    if (highlight) sb = esc_standout;
+
     for (i = 0; i < numberof(help_msg); ++i)
 	SHOW(help_msg[i]);
-    puts("Dump List:");
+    printf("%s""Dump List:%s\n", sb, se);
     for (i = 0; i < numberof(dumps); ++i)
 	SHOW(dumps[i]);
-    puts("Features:");
+    printf("%s""Features:%s\n", sb, se);
     for (i = 0; i < numberof(features); ++i)
 	SHOW(features[i]);
-    puts("JIT options (experimental):");
+    printf("%s""Warning categories:%s\n", sb, se);
+    for (i = 0; i < numberof(warn_categories); ++i)
+	SHOW(warn_categories[i]);
+    printf("%s""JIT options (experimental):%s\n", sb, se);
     for (i = 0; i < numberof(mjit_options); ++i)
 	SHOW(mjit_options[i]);
 }
@@ -490,13 +528,7 @@ str_conv_enc(VALUE str, rb_encoding *from, rb_encoding *to)
 # define str_conv_enc(str, from, to) (str)
 #endif
 
-void ruby_init_loadpath_safe(int safe_level);
-
-void
-ruby_init_loadpath(void)
-{
-    ruby_init_loadpath_safe(0);
-}
+void ruby_init_loadpath(void);
 
 #if defined(LOAD_RELATIVE)
 static VALUE
@@ -576,7 +608,7 @@ runtime_libruby_path(void)
 VALUE ruby_archlibdir_path, ruby_prefix_path;
 
 void
-ruby_init_loadpath_safe(int safe_level)
+ruby_init_loadpath(void)
 {
     VALUE load_path, archlibdir = 0;
     ID id_initial_load_path_mark;
@@ -659,9 +691,7 @@ ruby_init_loadpath_safe(int safe_level)
 
     load_path = GET_VM()->load_path;
 
-    if (safe_level == 0) {
-	ruby_push_include(getenv("RUBYLIB"), identical_path);
-    }
+    ruby_push_include(getenv("RUBYLIB"), identical_path);
 
     id_initial_load_path_mark = INITIAL_LOAD_PATH_MARK;
     while (*paths) {
@@ -881,9 +911,7 @@ feature_option(const char *str, int len, void *arg, const unsigned int enable)
     if (NAME_MATCH_P(#bit, str, len)) {set |= mask = FEATURE_BIT(bit); FEATURE_FOUND;}
     EACH_FEATURES(SET_FEATURE, ;);
     if (NAME_MATCH_P("all", str, len)) {
-      found:
-        FEATURE_SET_TO(*argp, mask, (mask & enable));
-	return;
+        goto found;
     }
 #if AMBIGUOUS_FEATURE_NAMES
     if (matched == 1) goto found;
@@ -903,6 +931,11 @@ feature_option(const char *str, int len, void *arg, const unsigned int enable)
     rb_warn("unknown argument for --%s: `%.*s'",
 	    enable ? "enable" : "disable", len, str);
     rb_warn("features are [%.*s].", (int)strlen(list), list);
+    return;
+
+  found:
+    FEATURE_SET_TO(*argp, mask, (mask & enable));
+    return;
 }
 
 static void
@@ -975,31 +1008,45 @@ set_option_encoding_once(const char *type, VALUE *name, const char *e, long elen
 static void
 setup_mjit_options(const char *s, struct mjit_options *mjit_opt)
 {
+#define opt_match(s, l, name) \
+    ((((l) > rb_strlen_lit(name)) ? (s)[rb_strlen_lit(name)] == '=' : \
+      (l) == rb_strlen_lit(name)) && \
+     memcmp((s), name, rb_strlen_lit(name)) == 0 && \
+     (((s) += rb_strlen_lit(name)), 1))
+#define opt_match_noarg(s, l, name) \
+    opt_match(s, l, name) && (*(s) ? (rb_warn("argument to --jit-" name " is ignored"), 1) : 1)
+#define opt_match_arg(s, l, name) \
+    opt_match(s, l, name) && (*(s) ? 1 : (rb_raise(rb_eRuntimeError, "--jit-" name " needs an argument"), 0))
+    if (*s != '-') return;
+    const size_t l = strlen(++s);
     if (*s == 0) return;
-    else if (strcmp(s, "-warnings") == 0) {
+    else if (opt_match_noarg(s, l, "warnings")) {
         mjit_opt->warnings = 1;
     }
-    else if (strcmp(s, "-debug") == 0) {
-        mjit_opt->debug = 1;
+    else if (opt_match(s, l, "debug")) {
+        if (*s)
+            mjit_opt->debug_flags = strdup(s + 1);
+        else
+            mjit_opt->debug = 1;
     }
-    else if (strcmp(s, "-wait") == 0) {
+    else if (opt_match_noarg(s, l, "wait")) {
         mjit_opt->wait = 1;
     }
-    else if (strcmp(s, "-save-temps") == 0) {
+    else if (opt_match_noarg(s, l, "save-temps")) {
         mjit_opt->save_temps = 1;
     }
-    else if (strncmp(s, "-verbose=", 9) == 0) {
-        mjit_opt->verbose = atoi(s + 9);
+    else if (opt_match(s, l, "verbose")) {
+        mjit_opt->verbose = *s ? atoi(s + 1) : 1;
     }
-    else if (strncmp(s, "-max-cache=", 11) == 0) {
-        mjit_opt->max_cache_size = atoi(s + 11);
+    else if (opt_match_arg(s, l, "max-cache")) {
+        mjit_opt->max_cache_size = atoi(s + 1);
     }
-    else if (strncmp(s, "-min-calls=", 11) == 0) {
-        mjit_opt->min_calls = atoi(s + 11);
+    else if (opt_match_arg(s, l, "min-calls")) {
+        mjit_opt->min_calls = atoi(s + 1);
     }
     else {
         rb_raise(rb_eRuntimeError,
-                 "invalid MJIT option `%s' (--help will show valid MJIT options)", s + 1);
+                 "invalid MJIT option `%s' (--help will show valid MJIT options)", s);
     }
 }
 #endif
@@ -1066,6 +1113,24 @@ proc_options(long argc, char **argv, ruby_cmdline_options_t *opt, int envopt)
 	    goto reswitch;
 
 	  case 'W':
+            if (s[1] == ':') {
+                unsigned int bits = 0;
+                static const char no_prefix[] = "no-";
+                int enable = strncmp(s += 2, no_prefix, sizeof(no_prefix)-1) != 0;
+                if (!enable) s += sizeof(no_prefix)-1;
+                size_t len = strlen(s);
+                if (NAME_MATCH_P("deprecated", s, len)) {
+                    bits = 1U << RB_WARN_CATEGORY_DEPRECATED;
+                }
+                else if (NAME_MATCH_P("experimental", s, len)) {
+                    bits = 1U << RB_WARN_CATEGORY_EXPERIMENTAL;
+                }
+                else {
+                    rb_warn("unknown warning category: `%s'", s);
+                }
+                if (bits) FEATURE_SET_TO(opt->warn, bits, enable ? bits : 0);
+                break;
+            }
 	    {
 		size_t numlen;
 		int v = 2;	/* -W as -W2 */
@@ -1225,18 +1290,15 @@ proc_options(long argc, char **argv, ruby_cmdline_options_t *opt, int envopt)
 	    goto reswitch;
 
 	  case 'T':
-	    {
-		size_t numlen;
-		int v = 1;
+            {
+                size_t numlen;
 
-		if (*++s) {
-		    v = scan_oct(s, 2, &numlen);
-		    if (numlen == 0)
-			v = 1;
-		    s += numlen;
-		}
-		if (v > opt->safe_level) opt->safe_level = v;
-	    }
+                if (*++s) {
+                    scan_oct(s, 2, &numlen);
+                    s += numlen;
+                }
+            }
+            rb_warn("ruby -T will be removed in Ruby 3.0");
 	    goto reswitch;
 
 	  case 'I':
@@ -1376,6 +1438,12 @@ proc_options(long argc, char **argv, ruby_cmdline_options_t *opt, int envopt)
 		opt->dump |= DUMP_BIT(help);
 		goto switch_end;
 	    }
+            else if (is_option_with_arg("backtrace-limit", Qfalse, Qfalse)) {
+                char *e;
+                long n = strtol(s, &e, 10);
+                if (errno == ERANGE || n < 0 || *e) rb_raise(rb_eRuntimeError, "wrong limit for backtrace length");
+                rb_backtrace_length_limit = n;
+            }
 	    else {
 		rb_raise(rb_eRuntimeError,
 			 "invalid option --%s  (-h will show valid options)", s);
@@ -1418,11 +1486,35 @@ proc_options(long argc, char **argv, ruby_cmdline_options_t *opt, int envopt)
     return argc0 - argc;
 }
 
+void Init_builtin_features(void);
+
 static void
 ruby_init_prelude(void)
 {
-    Init_prelude();
+    Init_builtin_features();
     rb_const_remove(rb_cObject, rb_intern_const("TMP_RUBY_PREFIX"));
+}
+
+void rb_call_builtin_inits(void);
+
+static void
+ruby_opt_init(ruby_cmdline_options_t *opt)
+{
+    if (opt->dump & dump_exit_bits) return;
+
+    if (opt->features.set & FEATURE_BIT(gems)) {
+        rb_define_module("Gem");
+        if (opt->features.set & FEATURE_BIT(did_you_mean)) {
+            rb_define_module("DidYouMean");
+        }
+    }
+
+    Init_ext(); /* load statically linked extensions before rubygems */
+    rb_call_builtin_inits();
+    ruby_init_prelude();
+
+    ruby_set_script_name(opt->script_name);
+    require_libraries(&opt->req_list);
 }
 
 static int
@@ -1446,13 +1538,13 @@ VALUE rb_argv0;
 VALUE rb_e_script;
 
 static VALUE
-false_value(void)
+false_value(ID _x, VALUE *_y)
 {
     return Qfalse;
 }
 
 static VALUE
-true_value(void)
+true_value(ID _x, VALUE *_y)
 {
     return Qtrue;
 }
@@ -1484,7 +1576,7 @@ uscore_get(void)
  */
 
 static VALUE
-rb_f_sub(int argc, VALUE *argv)
+rb_f_sub(int argc, VALUE *argv, VALUE _)
 {
     VALUE str = rb_funcall_passing_block(uscore_get(), rb_intern("sub"), argc, argv);
     rb_lastline_set(str);
@@ -1503,7 +1595,7 @@ rb_f_sub(int argc, VALUE *argv)
  */
 
 static VALUE
-rb_f_gsub(int argc, VALUE *argv)
+rb_f_gsub(int argc, VALUE *argv, VALUE _)
 {
     VALUE str = rb_funcall_passing_block(uscore_get(), rb_intern("gsub"), argc, argv);
     rb_lastline_set(str);
@@ -1521,7 +1613,7 @@ rb_f_gsub(int argc, VALUE *argv)
  */
 
 static VALUE
-rb_f_chop(void)
+rb_f_chop(VALUE _)
 {
     VALUE str = rb_funcall_passing_block(uscore_get(), rb_intern("chop"), 0, 0);
     rb_lastline_set(str);
@@ -1541,11 +1633,17 @@ rb_f_chop(void)
  */
 
 static VALUE
-rb_f_chomp(int argc, VALUE *argv)
+rb_f_chomp(int argc, VALUE *argv, VALUE _)
 {
     VALUE str = rb_funcall_passing_block(uscore_get(), rb_intern("chomp"), argc, argv);
     rb_lastline_set(str);
     return str;
+}
+
+static void
+setup_pager_env(void)
+{
+    if (!getenv("LESS")) ruby_setenv("LESS", "-R"); // Output "raw" control characters.
 }
 
 static VALUE
@@ -1562,28 +1660,77 @@ process_options(int argc, char **argv, ruby_cmdline_options_t *opt)
     const char *s;
     char fbuf[MAXPATHLEN];
     int i = (int)proc_options(argc, argv, opt, 0);
-    rb_binding_t *toplevel_binding;
-    const struct rb_block *base_block;
     unsigned int dump = opt->dump & dump_exit_bits;
 
     if (opt->dump & (DUMP_BIT(usage)|DUMP_BIT(help))) {
+        int tty = isatty(1);
 	const char *const progname =
 	    (argc > 0 && argv && argv[0] ? argv[0] :
 	     origarg.argc > 0 && origarg.argv && origarg.argv[0] ? origarg.argv[0] :
 	     ruby_engine);
-	usage(progname, (opt->dump & DUMP_BIT(help)));
+        int columns = 0;
+        if ((opt->dump & DUMP_BIT(help)) && tty) {
+            const char *pager_env = getenv("RUBY_PAGER");
+            if (!pager_env) pager_env = getenv("PAGER");
+            if (pager_env && *pager_env && isatty(0)) {
+                const char *columns_env = getenv("COLUMNS");
+                if (columns_env) columns = atoi(columns_env);
+                VALUE pager = rb_str_new_cstr(pager_env);
+#ifdef HAVE_WORKING_FORK
+                int fds[2];
+                if (rb_pipe(fds) == 0) {
+                    rb_pid_t pid = rb_fork();
+                    if (pid > 0) {
+                        /* exec PAGER with reading from child */
+                        dup2(fds[0], 0);
+                    }
+                    else if (pid == 0) {
+                        /* send the help message to the parent PAGER */
+                        dup2(fds[1], 1);
+                        dup2(fds[1], 2);
+                    }
+                    close(fds[0]);
+                    close(fds[1]);
+                    if (pid > 0) {
+                        setup_pager_env();
+                        rb_f_exec(1, &pager);
+                        kill(SIGTERM, pid);
+                        rb_waitpid(pid, 0, 0);
+                    }
+                }
+#else
+                setup_pager_env();
+                VALUE port = rb_io_popen(pager, rb_str_new_lit("w"), Qnil, Qnil);
+                if (!NIL_P(port)) {
+                    int oldout = dup(1);
+                    int olderr = dup(2);
+                    int fd = RFILE(port)->fptr->fd;
+                    dup2(fd, 1);
+                    dup2(fd, 2);
+                    /* more.com doesn't support CSI sequence */
+                    usage(progname, 1, 0, columns);
+                    fflush(stdout);
+                    dup2(oldout, 1);
+                    dup2(olderr, 2);
+                    rb_io_close(port);
+                    return Qtrue;
+                }
+#endif
+            }
+        }
+	usage(progname, (opt->dump & DUMP_BIT(help)), tty, columns);
 	return Qtrue;
     }
 
     argc -= i;
     argv += i;
 
-    if ((opt->features.set & FEATURE_BIT(rubyopt)) &&
-	opt->safe_level == 0 && (s = getenv("RUBYOPT"))) {
+    if ((opt->features.set & FEATURE_BIT(rubyopt)) && (s = getenv("RUBYOPT"))) {
 	VALUE src_enc_name = opt->src.enc.name;
 	VALUE ext_enc_name = opt->ext.enc.name;
 	VALUE int_enc_name = opt->intern.enc.name;
         ruby_features_t feat = opt->features;
+        ruby_features_t warn = opt->warn;
 
 	opt->src.enc.name = opt->ext.enc.name = opt->intern.enc.name = 0;
 	moreswitches(s, opt, 1);
@@ -1593,7 +1740,8 @@ process_options(int argc, char **argv, ruby_cmdline_options_t *opt)
 	    opt->ext.enc.name = ext_enc_name;
 	if (int_enc_name)
 	    opt->intern.enc.name = int_enc_name;
-        FEATURE_SET_TO(opt->features, feat.mask, feat.set & feat.mask);
+        FEATURE_SET_RESTORE(opt->features, feat);
+        FEATURE_SET_RESTORE(opt->warn, warn);
     }
 
     if (opt->src.enc.name)
@@ -1657,12 +1805,12 @@ process_options(int argc, char **argv, ruby_cmdline_options_t *opt)
     translit_char(RSTRING_PTR(opt->script_name), '\\', '/');
 #endif
 
-    ruby_gc_set_params(opt->safe_level);
-    ruby_init_loadpath_safe(opt->safe_level);
+    ruby_gc_set_params();
+    ruby_init_loadpath();
 
 #if USE_MJIT
     if (opt->mjit.on)
-        /* Using TMP_RUBY_PREFIX created by ruby_init_loadpath_safe(). */
+        /* Using TMP_RUBY_PREFIX created by ruby_init_loadpath(). */
         mjit_init(&opt->mjit);
 #endif
 
@@ -1739,14 +1887,7 @@ process_options(int argc, char **argv, ruby_cmdline_options_t *opt)
             rb_ary_replace(vm->load_path_snapshot, load_path);
         }
     }
-    Init_ext();		/* load statically linked extensions before rubygems */
-    if (opt->features.set & FEATURE_BIT(gems)) {
-	rb_define_module("Gem");
-        if (opt->features.set & FEATURE_BIT(did_you_mean)) {
-	    rb_define_module("DidYouMean");
-	}
-    }
-    ruby_init_prelude();
+
     if (opt->features.mask & COMPILATION_FEATURES) {
 	VALUE option = rb_hash_new();
 #define SET_COMPILE_OPTION(h, o, name) \
@@ -1760,13 +1901,7 @@ process_options(int argc, char **argv, ruby_cmdline_options_t *opt)
     ruby_set_argv(argc, argv);
     process_sflag(&opt->sflag);
 
-    GetBindingPtr(rb_const_get(rb_cObject, rb_intern("TOPLEVEL_BINDING")),
-		  toplevel_binding);
-    /* need to acquire env from toplevel_binding each time, since it
-     * may update after eval() */
-
-    base_block = toplevel_context(toplevel_binding);
-    rb_parser_set_context(parser, base_block, TRUE);
+    rb_parser_set_context(parser, 0, TRUE);
 
     if (opt->e_script) {
 	VALUE progname = rb_progname;
@@ -1786,13 +1921,11 @@ process_options(int argc, char **argv, ruby_cmdline_options_t *opt)
 	}
 #endif
 	rb_enc_associate(opt->e_script, eenc);
-	if (!(opt->dump & ~DUMP_BIT(version_v))) {
-	    ruby_set_script_name(opt->script_name);
-	    require_libraries(&opt->req_list);
-	}
+        ruby_opt_init(opt);
         ruby_set_script_name(progname);
 	rb_parser_set_options(parser, opt->do_print, opt->do_loop,
 			      opt->do_line, opt->do_split);
+        rb_warning_category_update(opt->warn.mask, opt->warn.set);
 	ast = rb_parser_compile_string(parser, opt->script, opt->e_script, 1);
     }
     else {
@@ -1867,7 +2000,11 @@ process_options(int argc, char **argv, ruby_cmdline_options_t *opt)
 		rb_enc_copy(path, opt->script_name);
 	    }
 	}
-	base_block = toplevel_context(toplevel_binding);
+
+        rb_binding_t *toplevel_binding;
+        GetBindingPtr(rb_const_get(rb_cObject, rb_intern("TOPLEVEL_BINDING")),
+                      toplevel_binding);
+        const struct rb_block *base_block = toplevel_context(toplevel_binding);
 	iseq = rb_iseq_new_main(&ast->body, opt->script_name, path, vm_block_iseq(base_block));
 	rb_ast_dispose(ast);
     }
@@ -1887,8 +2024,6 @@ process_options(int argc, char **argv, ruby_cmdline_options_t *opt)
     if ((rb_e_script = opt->e_script) != 0) {
         rb_gc_register_mark_object(opt->e_script);
     }
-
-    rb_set_safe_level(opt->safe_level);
 
     {
         rb_execution_context_t *ec = GET_EC();
@@ -2013,10 +2148,7 @@ load_file_internal(VALUE argp_v)
         if (NIL_P(c)) {
 	    argp->f = f = Qnil;
 	}
-	if (!(opt->dump & ~DUMP_BIT(version_v))) {
-	    ruby_set_script_name(opt->script_name);
-	    require_libraries(&opt->req_list);	/* Why here? unnatural */
-	}
+        ruby_opt_init(opt);
     }
     if (opt->src.enc.index >= 0) {
 	enc = rb_enc_from_index(opt->src.enc.index);
@@ -2029,6 +2161,7 @@ load_file_internal(VALUE argp_v)
     }
     rb_parser_set_options(parser, opt->do_print, opt->do_loop,
 			  opt->do_line, opt->do_split);
+    rb_warning_category_update(opt->warn.mask, opt->warn.set);
     if (NIL_P(f)) {
 	f = rb_str_new(0, 0);
 	rb_enc_associate(f, enc);
@@ -2230,7 +2363,7 @@ ruby_setproctitle(VALUE title)
 }
 
 static void
-set_arg0(VALUE val, ID id)
+set_arg0(VALUE val, ID id, VALUE *_)
 {
     if (origarg.argv == 0)
 	rb_raise(rb_eRuntimeError, "$0 not initialized");
@@ -2244,7 +2377,6 @@ external_str_new_cstr(const char *p)
 #if UTF8_PATH
     VALUE str = rb_utf8_str_new_cstr(p);
     str = str_conv_enc(str, NULL, rb_default_external_encoding());
-    OBJ_TAINT_RAW(str);
     return str;
 #else
     return rb_external_str_new_cstr(p);
@@ -2286,9 +2418,6 @@ init_ids(ruby_cmdline_options_t *opt)
 
     if (uid != euid) opt->setids |= 1;
     if (egid != gid) opt->setids |= 2;
-    if (uid && opt->setids) {
-	if (opt->safe_level < 1) opt->safe_level = 1;
-    }
 }
 
 #undef forbid_setid
@@ -2299,21 +2428,17 @@ forbid_setid(const char *s, const ruby_cmdline_options_t *opt)
         rb_raise(rb_eSecurityError, "no %s allowed while running setuid", s);
     if (opt->setids & 2)
         rb_raise(rb_eSecurityError, "no %s allowed while running setgid", s);
-    if (opt->safe_level > 0)
-        rb_raise(rb_eSecurityError, "no %s allowed in tainted mode", s);
 }
 
 static void
-verbose_setter(VALUE val, ID id, void *data)
+verbose_setter(VALUE val, ID id, VALUE *variable)
 {
-    VALUE *variable = data;
     *variable = RTEST(val) ? Qtrue : val;
 }
 
 static VALUE
-opt_W_getter(ID id, void *data)
+opt_W_getter(ID id, VALUE *variable)
 {
-    VALUE *variable = data;
     switch (*variable) {
       case Qnil:
 	return INT2FIX(0);

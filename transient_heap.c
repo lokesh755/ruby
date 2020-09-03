@@ -6,14 +6,20 @@
 
 **********************************************************************/
 
-#include "ruby/ruby.h"
-#include "ruby/debug.h"
-#include "vm_debug.h"
+#include "debug_counter.h"
 #include "gc.h"
 #include "internal.h"
+#include "internal/gc.h"
+#include "internal/hash.h"
+#include "internal/sanitizers.h"
+#include "internal/static_assert.h"
+#include "internal/struct.h"
+#include "internal/variable.h"
+#include "ruby/debug.h"
+#include "ruby/ruby.h"
 #include "ruby_assert.h"
 #include "transient_heap.h"
-#include "debug_counter.h"
+#include "vm_debug.h"
 
 #if USE_TRANSIENT_HEAP /* USE_TRANSIENT_HEAP */
 /*
@@ -294,6 +300,9 @@ transient_heap_block_alloc(struct transient_heap* theap)
 #else
     if (theap->arena == NULL) {
         theap->arena = rb_aligned_malloc(TRANSIENT_HEAP_BLOCK_SIZE, TRANSIENT_HEAP_TOTAL_SIZE);
+        if (theap->arena == NULL) {
+             rb_bug("transient_heap_block_alloc: failed\n");
+        }
     }
 
     TH_ASSERT(theap->arena_index < TRANSIENT_HEAP_BLOCK_NUM);
@@ -440,6 +449,9 @@ Init_TransientHeap(void)
     theap->promoted_objects_index = 0;
     /* should not use ALLOC_N to be free from GC */
     theap->promoted_objects = malloc(sizeof(VALUE) * theap->promoted_objects_size);
+    STATIC_ASSERT(
+        integer_overflow,
+        sizeof(VALUE) <= SIZE_MAX / TRANSIENT_HEAP_PROMOTED_DEFAULT_SIZE);
     if (theap->promoted_objects == NULL) rb_bug("Init_TransientHeap: malloc failed.");
 }
 
@@ -618,7 +630,13 @@ transient_heap_promote_add(struct transient_heap* theap, VALUE obj)
     if (theap->promoted_objects_size <= theap->promoted_objects_index) {
         theap->promoted_objects_size *= 2;
         if (TRANSIENT_HEAP_DEBUG >= 1) fprintf(stderr, "rb_transient_heap_promote: expand table to %d\n", theap->promoted_objects_size);
-        theap->promoted_objects = realloc(theap->promoted_objects, theap->promoted_objects_size * sizeof(VALUE));
+        if (UNLIKELY((size_t)theap->promoted_objects_size > SIZE_MAX / sizeof(VALUE))) {
+            /* realloc failure due to integer overflow */
+            theap->promoted_objects = NULL;
+        }
+        else {
+            theap->promoted_objects = realloc(theap->promoted_objects, theap->promoted_objects_size * sizeof(VALUE));
+        }
         if (theap->promoted_objects == NULL) rb_bug("rb_transient_heap_promote: realloc failed");
     }
     theap->promoted_objects[theap->promoted_objects_index++] = obj;
@@ -714,9 +732,26 @@ transient_heap_block_evacuate(struct transient_heap* theap, struct transient_hea
     }
 }
 
+#if USE_RUBY_DEBUG_LOG
+static const char *
+transient_heap_status_cstr(enum transient_heap_status status)
+{
+    switch (status) {
+      case transient_heap_none: return "none";
+      case transient_heap_marking: return "marking";
+      case transient_heap_escaping: return "escaping";
+    }
+    UNREACHABLE_RETURN(NULL);
+}
+#endif
+
 static void
 transient_heap_update_status(struct transient_heap* theap, enum transient_heap_status status)
 {
+    RUBY_DEBUG_LOG("%s -> %s",
+                   transient_heap_status_cstr(theap->status),
+                   transient_heap_status_cstr(status));
+
     TH_ASSERT(theap->status != status);
     theap->status = status;
 }
@@ -855,6 +890,8 @@ rb_transient_heap_update_references(void)
 void
 rb_transient_heap_start_marking(int full_marking)
 {
+    RUBY_DEBUG_LOG("full?:%d", full_marking);
+
     struct transient_heap* theap = transient_heap_get();
 
     if (TRANSIENT_HEAP_DEBUG >= 1) fprintf(stderr, "!! rb_transient_heap_start_marking objects:%d blocks:%d promtoed:%d full_marking:%d\n",
@@ -903,6 +940,8 @@ rb_transient_heap_start_marking(int full_marking)
 void
 rb_transient_heap_finish_marking(void)
 {
+    RUBY_DEBUG_LOG("", 0);
+
     struct transient_heap* theap = transient_heap_get();
 
     if (TRANSIENT_HEAP_DEBUG >= 1) fprintf(stderr, "!! rb_transient_heap_finish_marking objects:%d, marked:%d\n",

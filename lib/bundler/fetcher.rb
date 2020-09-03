@@ -97,7 +97,7 @@ module Bundler
       spec -= [nil, "ruby", ""]
       spec_file_name = "#{spec.join "-"}.gemspec"
 
-      uri = URI.parse("#{remote_uri}#{Gem::MARSHAL_SPEC_DIR}#{spec_file_name}.rz")
+      uri = Bundler::URI.parse("#{remote_uri}#{Gem::MARSHAL_SPEC_DIR}#{spec_file_name}.rz")
       if uri.scheme == "file"
         path = Bundler.rubygems.correct_for_windows_path(uri.path)
         Bundler.load_marshal Bundler.rubygems.inflate(Gem.read_binary(path))
@@ -229,6 +229,7 @@ module Bundler
         "BUILDBOX" => "buildbox",
         "GO_SERVER_URL" => "go",
         "SNAP_CI" => "snap",
+        "GITLAB_CI" => "gitlab",
         "CI_NAME" => ENV["CI_NAME"],
         "CI" => "ci",
       }
@@ -244,7 +245,7 @@ module Bundler
 
         con = PersistentHTTP.new :name => "bundler", :proxy => :ENV
         if gem_proxy = Bundler.rubygems.configuration[:http_proxy]
-          con.proxy = URI.parse(gem_proxy) if gem_proxy != :no_proxy
+          con.proxy = Bundler::URI.parse(gem_proxy) if gem_proxy != :no_proxy
         end
 
         if remote_uri.scheme == "https"

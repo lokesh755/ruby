@@ -26,11 +26,21 @@ class TestRipper::ParserEvents < Test::Unit::TestCase
   end
 
   def warning(str)
-    parse(str, :warning) {|e, *args| return args}
+    tree = parse(str, :warning) {|e, *args| return args}
+    if block_given?
+      yield tree
+    else
+      assert(false, "warning expected")
+    end
   end
 
   def warn(str)
-    parse(str, :warn) {|e, *args| return args}
+    tree = parse(str, :warn) {|e, *args| return args}
+    if block_given?
+      yield tree
+    else
+      assert(false, "warning expected")
+    end
   end
 
   def test_program
@@ -58,7 +68,9 @@ class TestRipper::ParserEvents < Test::Unit::TestCase
     assert_equal '[assign(var_field(a),ref(a))]', parse('a=a')
     assert_equal '[ref(nil)]', parse('nil')
     assert_equal '[ref(true)]', parse('true')
-    assert_include parse('proc{@1}'), '[ref(@1)]'
+    assert_equal '[vcall(_0)]', parse('_0')
+    assert_equal '[vcall(_1)]', parse('_1')
+    assert_include parse('proc{_1}'), '[ref(_1)]'
   end
 
   def test_vcall
@@ -127,6 +139,20 @@ class TestRipper::ParserEvents < Test::Unit::TestCase
     thru_args_new = false
     parse('m()', :on_args_new) {thru_args_new = true}
     assert_equal true, thru_args_new
+  end
+
+  def test_args_forward
+    [
+      'def m(...) n(...) end',
+      'def m(...) end',
+      'def m(a, ...) n(1, ...) end',
+      'def m(...) n(1, ...) end',
+      'def m(a, ...) n(...) end'
+    ].each do |code|
+      thru_args_forward = false
+      parse(code, :on_args_forward) {thru_args_forward = true}
+      assert_equal true, thru_args_forward, "no args_forward for: #{code}"
+    end
   end
 
   def test_arg_paren
@@ -435,13 +461,6 @@ class TestRipper::ParserEvents < Test::Unit::TestCase
     assert_equal "[call(ref(self),&.,foo,[])]", tree
   end
 
-  def test_methref
-    thru_methref = false
-    tree = parse("obj.:foo", :on_methref) {thru_methref = true}
-    assert_equal true, thru_methref
-    assert_equal "[methref(vcall(obj),foo)]", tree
-  end
-
   def test_excessed_comma
     thru_excessed_comma = false
     parse("proc{|x,|}", :on_excessed_comma) {thru_excessed_comma = true}
@@ -641,6 +660,11 @@ class TestRipper::ParserEvents < Test::Unit::TestCase
     }
     assert_equal true, thru_def
     assert_equal '[def(foo,[],bodystmt([void()]))]', parse('def foo ;end')
+
+    thru_def = false
+    tree = parse('def foo() = 42', :on_def) {thru_def = true}
+    assert_equal true, thru_def
+    assert_equal '[def(foo,[],42)]', tree
   end
 
   def test_defined
@@ -658,6 +682,11 @@ class TestRipper::ParserEvents < Test::Unit::TestCase
     thru_parse_error = false
     tree = parse('def foo&.bar; end', :on_parse_error) {thru_parse_error = true}
     assert_equal(true, thru_parse_error)
+
+    thru_defs = false
+    tree = parse('def foo.bar() = 42', :on_defs) {thru_defs = true}
+    assert_equal true, thru_defs
+    assert_equal '[defs(vcall(foo),.,bar,[],42)]', tree
   end
 
   def test_do_block
@@ -944,6 +973,10 @@ class TestRipper::ParserEvents < Test::Unit::TestCase
     parse('a {|**x|}', :on_params) {|_, *v| thru_params = true; arg = v}
     assert_equal true, thru_params
     assert_equal [nil, nil, nil, nil, nil, "**x", nil], arg
+    thru_params = false
+    parse('a {|**nil|}', :on_params) {|_, *v| thru_params = true; arg = v}
+    assert_equal true, thru_params
+    assert_equal [nil, nil, nil, nil, nil, :nil, nil], arg
   end
 
   def test_params_mlhs
@@ -1151,6 +1184,12 @@ class TestRipper::ParserEvents < Test::Unit::TestCase
     thru_kwrest = false
     parse('def a(**x) end', :on_kwrest_param) {|n, val| thru_kwrest = val}
     assert_equal "x", thru_kwrest
+  end
+
+  def test_nokw_param
+    thru_nokw = false
+    parse('def a(**nil) end', :on_nokw_param) {|n, val| thru_nokw = val}
+    assert_equal nil, thru_nokw
   end
 
   def test_retry
@@ -1479,26 +1518,17 @@ class TestRipper::ParserEvents < Test::Unit::TestCase
   end
 
   def test_block_variables
-    assert_equal("[fcall(proc,[],&block([],[void()]))]", parse("proc{|;y|}"))
-    if defined?(Process::RLIMIT_AS)
-      dir = File.dirname(__FILE__)
-      as = (RubyVM::MJIT.enabled? ? 150 : 100) * 1024 * 1024
-      assert_in_out_err(%W(-I#{dir} -rdummyparser),
-                        "Process.setrlimit(Process::RLIMIT_AS,#{as}); "\
-                        "puts DummyParser.new('proc{|;y|!y}').parse",
-                        ["[fcall(proc,[],&block([],[unary(!,ref(y))]))]"], [], '[ruby-dev:39423]')
-    end
+    bug4159 = '[ruby-dev:39423]'
+    assert_equal("[fcall(proc,[],&block([],[void()]))]", parse("proc{|;y|}"), bug4159)
+    assert_equal("[fcall(proc,[],&block([],[unary(!,ref(y))]))]", parse("proc{|;y|!y}"), bug4159)
   end
 
   def test_unterminated_regexp
     assert_equal("unterminated regexp meets end of file", compile_error('/'))
   end
 
-  def test_invalid_numbered_parameter_name
-    assert_equal("leading zero is not allowed as a numbered parameter", compile_error('proc{@0}'))
-  end
-
   def test_invalid_instance_variable_name
+    assert_equal("`@1' is not allowed as an instance variable name", compile_error('proc{@1}'))
     assert_equal("`@' without identifiers is not allowed as an instance variable name", compile_error('@%'))
     assert_equal("`@' without identifiers is not allowed as an instance variable name", compile_error('@'))
   end
@@ -1526,6 +1556,16 @@ class TestRipper::ParserEvents < Test::Unit::TestCase
     assert_match(/encountered/, fmt)
   end
 
+  def test_warn_mismatched_indentations
+    fmt, tokend, tokbeg, line = assert_warning("") {break warn("if true\n  end\n")}
+    assert_match(/mismatched indentations/, fmt)
+    assert_equal(["if", "end", 1], [tokbeg, tokend, line])
+    result = assert_warning("") {
+      warn("begin\n" "  def f() = nil\n" "end\n") {break :ok}
+    }
+    assert_equal(:ok, result)
+  end
+
   def test_in
     thru_in = false
     parse('case 0; in 0; end', :on_in) {thru_in = true}
@@ -1536,6 +1576,12 @@ class TestRipper::ParserEvents < Test::Unit::TestCase
     thru_aryptn = false
     parse('case 0; in [0]; end', :on_aryptn) {thru_aryptn = true}
     assert_equal true, thru_aryptn
+  end
+
+  def test_fndptn
+    thru_fndptn = false
+    parse('case 0; in [*,0,*]; end', :on_fndptn) {thru_fndptn = true}
+    assert_equal true, thru_fndptn
   end
 
   def test_hshptn

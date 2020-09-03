@@ -1,11 +1,9 @@
-# coding: UTF-8
 # frozen_string_literal: true
 
 require 'rubygems/test_case'
 require 'rubygems/ext'
 
 class TestGemExtExtConfBuilder < Gem::TestCase
-
   def setup
     super
 
@@ -17,7 +15,7 @@ class TestGemExtExtConfBuilder < Gem::TestCase
   end
 
   def test_class_build
-    if java_platform? && ENV["CI"]
+    if java_platform?
       skip("failing on jruby")
     end
 
@@ -49,7 +47,7 @@ class TestGemExtExtConfBuilder < Gem::TestCase
   end
 
   def test_class_build_rbconfig_make_prog
-    if java_platform? && ENV["CI"]
+    if java_platform?
       skip("failing on jruby")
     end
 
@@ -76,7 +74,7 @@ class TestGemExtExtConfBuilder < Gem::TestCase
     env_make = ENV.delete 'MAKE'
     ENV['MAKE'] = 'anothermake'
 
-    if java_platform? && ENV["CI"]
+    if java_platform?
       skip("failing on jruby")
     end
 
@@ -241,5 +239,4 @@ end
       RbConfig::CONFIG.delete 'configure_args'
     end
   end
-
 end

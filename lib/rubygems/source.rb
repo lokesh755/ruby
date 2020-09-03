@@ -1,7 +1,6 @@
 # frozen_string_literal: true
-autoload :FileUtils, 'fileutils'
-autoload :URI, 'uri'
 
+require "rubygems/text"
 ##
 # A Source knows how to list and fetch gems from a RubyGems marshal index.
 #
@@ -9,8 +8,8 @@ autoload :URI, 'uri'
 # bundler dependency API and so-forth.
 
 class Gem::Source
-
   include Comparable
+  include Gem::Text
 
   FILES = { # :nodoc:
     :released   => 'specs',
@@ -106,7 +105,7 @@ class Gem::Source
   def cache_dir(uri)
     # Correct for windows paths
     escaped_path = uri.path.sub(/^\/([a-z]):\//i, '/\\1-/')
-    escaped_path.untaint
+    escaped_path.tap(&Gem::UNTAINT)
 
     File.join Gem.spec_cache_dir, "#{uri.host}%#{uri.port}", File.dirname(escaped_path)
   end
@@ -219,6 +218,10 @@ class Gem::Source
     end
   end
 
+  def typo_squatting?(host, distance_threshold=4)
+    return if @uri.host.nil?
+    levenshtein_distance(@uri.host, host) <= distance_threshold
+  end
 end
 
 require 'rubygems/source/git'

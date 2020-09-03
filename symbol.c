@@ -9,13 +9,22 @@
 
 **********************************************************************/
 
+#include "gc.h"
+#include "internal.h"
+#include "internal/error.h"
+#include "internal/gc.h"
+#include "internal/hash.h"
+#include "internal/object.h"
+#include "internal/symbol.h"
+#include "internal/vm.h"
+#include "probes.h"
 #include "ruby/encoding.h"
 #include "ruby/st.h"
-#include "internal.h"
 #include "symbol.h"
-#include "gc.h"
-#include "probes.h"
 
+#ifndef USE_SYMBOL_GC
+# define USE_SYMBOL_GC 1
+#endif
 #ifndef SYMBOL_DEBUG
 # define SYMBOL_DEBUG 0
 #endif
@@ -92,8 +101,6 @@ WARN_UNUSED_RESULT(static VALUE dsymbol_check(const VALUE sym));
 WARN_UNUSED_RESULT(static ID lookup_str_id(VALUE str));
 WARN_UNUSED_RESULT(static VALUE lookup_str_sym(const VALUE str));
 WARN_UNUSED_RESULT(static VALUE lookup_id_str(ID id));
-WARN_UNUSED_RESULT(static ID attrsetname_to_attr(VALUE name));
-WARN_UNUSED_RESULT(static ID attrsetname_to_attr_id(VALUE name));
 WARN_UNUSED_RESULT(static ID intern_str(VALUE str, int mutable));
 
 ID
@@ -152,12 +159,6 @@ rb_id_attrset(ID id)
     sym = lookup_str_sym(str);
     id = sym ? rb_sym2id(sym) : intern_str(str, 1);
     return id;
-}
-
-ID
-rb_id_attrget(ID id)
-{
-    return attrsetname_to_attr(rb_id2str(id));
 }
 
 static int
@@ -237,109 +238,162 @@ rb_sym_constant_char_p(const char *name, long nlen, rb_encoding *enc)
 #define IDSET_ATTRSET_FOR_SYNTAX ((1U<<ID_LOCAL)|(1U<<ID_CONST))
 #define IDSET_ATTRSET_FOR_INTERN (~(~0U<<(1<<ID_SCOPE_SHIFT)) & ~(1U<<ID_ATTRSET))
 
-int
-rb_enc_symname_type(const char *name, long len, rb_encoding *enc, unsigned int allowed_attrset)
+struct enc_synmane_type_leading_chars_tag {
+    const enum { invalid, stophere, needmore, } kind;
+    const enum ruby_id_types type;
+    const long nread;
+};
+
+#define t struct enc_synmane_type_leading_chars_tag
+
+static struct enc_synmane_type_leading_chars_tag
+enc_synmane_type_leading_chars(const char *name, long len, rb_encoding *enc, int allowed_attrset)
 {
     const char *m = name;
     const char *e = m + len;
-    int type = ID_JUNK;
 
-    if (!rb_enc_asciicompat(enc)) return -1;
-    if (!m || len <= 0) return -1;
+    if (! rb_enc_asciicompat(enc)) {
+        return (t) { invalid, 0, 0, };
+    }
+    else if (! m) {
+        return (t) { invalid, 0, 0, };
+    }
+    else if ( len <= 0 ) {
+        return (t) { invalid, 0, 0, };
+    }
     switch (*m) {
       case '\0':
-	return -1;
+        return (t) { invalid, 0, 0, };
 
       case '$':
-	type = ID_GLOBAL;
-	if (is_special_global_name(++m, e, enc)) return type;
-	goto id;
+        if (is_special_global_name(++m, e, enc)) {
+            return (t) { stophere, ID_GLOBAL, len, };
+        }
+        else {
+            return (t) { needmore, ID_GLOBAL, 1, };
+        }
 
       case '@':
-	type = ID_INSTANCE;
-	if (*++m == '@') {
-	    ++m;
-	    type = ID_CLASS;
-	}
-	goto id;
+        switch (*++m) {
+          default:  return (t) { needmore, ID_INSTANCE, 1, };
+          case '@': return (t) { needmore, ID_CLASS,    2, };
+        }
 
       case '<':
 	switch (*++m) {
-	  case '<': ++m; break;
-	  case '=': if (*++m == '>') ++m; break;
-	  default: break;
+          default:  return (t) { stophere, ID_JUNK, 1, };
+          case '<': return (t) { stophere, ID_JUNK, 2, };
+          case '=':
+            switch (*++m) {
+              default:  return (t) { stophere, ID_JUNK, 2, };
+              case '>': return (t) { stophere, ID_JUNK, 3, };
+            }
 	}
-	break;
 
       case '>':
 	switch (*++m) {
-	  case '>': case '=': ++m; break;
+          default:            return (t) { stophere, ID_JUNK, 1, };
+          case '>': case '=': return (t) { stophere, ID_JUNK, 2, };
 	}
-	break;
 
       case '=':
 	switch (*++m) {
-	  case '~': ++m; break;
-	  case '=': if (*++m == '=') ++m; break;
-	  default: return -1;
+          default:  return (t) { invalid,  0,       1, };
+          case '~': return (t) { stophere, ID_JUNK, 2, };
+          case '=':
+            switch (*++m) {
+              default:  return (t) { stophere, ID_JUNK, 2, };
+              case '=': return (t) { stophere, ID_JUNK, 3, };
+            }
 	}
-	break;
 
       case '*':
-	if (*++m == '*') ++m;
-	break;
+        switch (*++m) {
+          default:  return (t) { stophere, ID_JUNK, 1, };
+          case '*': return (t) { stophere, ID_JUNK, 2, };
+        }
 
       case '+': case '-':
-	if (*++m == '@') ++m;
-	break;
+        switch (*++m) {
+          default:  return (t) { stophere, ID_JUNK, 1, };
+          case '@': return (t) { stophere, ID_JUNK, 2, };
+        }
 
       case '|': case '^': case '&': case '/': case '%': case '~': case '`':
-	++m;
-	break;
+        return (t) { stophere, ID_JUNK, 1, };
 
       case '[':
-	if (m[1] != ']') goto id;
-	++m;
-	if (*++m == '=') ++m;
-	break;
+        switch (*++m) {
+          default: return (t) { needmore, ID_JUNK, 0, };
+          case ']':
+            switch (*++m) {
+              default:  return (t) { stophere, ID_JUNK, 2, };
+              case '=': return (t) { stophere, ID_JUNK, 3, };
+            }
+        }
 
       case '!':
-	if (len == 1) return ID_JUNK;
 	switch (*++m) {
-	  case '=': case '~': ++m; break;
+          case '=': case '~': return (t) { stophere, ID_JUNK, 2, };
 	  default:
-	    if (allowed_attrset & (1U << ID_JUNK)) goto id;
-	    return -1;
+            if (allowed_attrset & (1U << ID_JUNK)) {
+                return (t) { needmore, ID_JUNK, 1, };
+            }
+            else {
+                return (t) { stophere, ID_JUNK, 1, };
+            }
 	}
-	break;
 
       default:
-	type = rb_sym_constant_char_p(m, e-m, enc) ? ID_CONST : ID_LOCAL;
-      id:
-	if (m >= e || (*m != '_' && !ISALPHA(*m) && ISASCII(*m))) {
-	    if (len > 1 && *(e-1) == '=') {
-		type = rb_enc_symname_type(name, len-1, enc, allowed_attrset);
-		if (type != ID_ATTRSET) return ID_ATTRSET;
-	    }
-	    return -1;
-	}
-	while (m < e && is_identchar(m, e, enc)) m += rb_enc_mbclen(m, e, enc);
-	if (m >= e) break;
-	switch (*m) {
-	  case '!': case '?':
-	    if (type == ID_GLOBAL || type == ID_CLASS || type == ID_INSTANCE) return -1;
-	    type = ID_JUNK;
-	    ++m;
-	    if (m + 1 < e || *m != '=') break;
-	    /* fall through */
-	  case '=':
-	    if (!(allowed_attrset & (1U << type))) return -1;
-	    type = ID_ATTRSET;
-	    ++m;
-	    break;
-	}
-	break;
+        if (rb_sym_constant_char_p(name, len, enc)) {
+            return (t) { needmore, ID_CONST, 0, };
+        }
+        else {
+            return (t) { needmore, ID_LOCAL, 0, };
+        }
     }
+}
+#undef t
+
+int
+rb_enc_symname_type(const char *name, long len, rb_encoding *enc, unsigned int allowed_attrset)
+{
+    const struct enc_synmane_type_leading_chars_tag f =
+        enc_synmane_type_leading_chars(name, len, enc, allowed_attrset);
+    const char *m = name + f.nread;
+    const char *e = name + len;
+    int type = (int)f.type;
+
+    switch (f.kind) {
+      case invalid:  return -1;
+      case stophere: goto stophere;
+      case needmore: break;
+    }
+
+    if (m >= e || (*m != '_' && !ISALPHA(*m) && ISASCII(*m))) {
+        if (len > 1 && *(e-1) == '=') {
+            type = rb_enc_symname_type(name, len-1, enc, allowed_attrset);
+            if (type != ID_ATTRSET) return ID_ATTRSET;
+        }
+        return -1;
+    }
+    while (m < e && is_identchar(m, e, enc)) m += rb_enc_mbclen(m, e, enc);
+    if (m >= e) goto stophere;
+    switch (*m) {
+      case '!': case '?':
+        if (type == ID_GLOBAL || type == ID_CLASS || type == ID_INSTANCE) return -1;
+        type = ID_JUNK;
+        ++m;
+        if (m + 1 < e || *m != '=') break;
+        /* fall through */
+      case '=':
+        if (!(allowed_attrset & (1U << type))) return -1;
+        type = ID_ATTRSET;
+        ++m;
+        break;
+    }
+
+  stophere:
     return m == e ? type : -1;
 }
 
@@ -739,7 +793,8 @@ rb_str_intern(VALUE str)
 	enc = ascii;
     }
     else {
-	str = rb_str_new_frozen(str);
+        str = rb_str_dup(str);
+        OBJ_FREEZE(str);
     }
     str = rb_fstring(str);
     type = rb_str_symname_type(str, IDSET_ATTRSET_FOR_INTERN);
@@ -843,22 +898,6 @@ symbols_i(st_data_t key, st_data_t value, st_data_t arg)
 
 }
 
-/*
- *  call-seq:
- *     Symbol.all_symbols    => array
- *
- *  Returns an array of all the symbols currently in Ruby's symbol
- *  table.
- *
- *     Symbol.all_symbols.size    #=> 903
- *     Symbol.all_symbols[1,20]   #=> [:floor, :ARGV, :Binding, :symlink,
- *                                     :chown, :EOFError, :$;, :String,
- *                                     :LOCK_SH, :"setuid?", :$<,
- *                                     :default_proc, :compact, :extend,
- *                                     :Tms, :getwd, :$=, :ThreadGroup,
- *                                     :wait2, :$>]
- */
-
 VALUE
 rb_sym_all_symbols(void)
 {
@@ -922,39 +961,9 @@ rb_is_const_sym(VALUE sym)
 }
 
 int
-rb_is_class_sym(VALUE sym)
-{
-    return is_class_sym(sym);
-}
-
-int
-rb_is_global_sym(VALUE sym)
-{
-    return is_global_sym(sym);
-}
-
-int
-rb_is_instance_sym(VALUE sym)
-{
-    return is_instance_sym(sym);
-}
-
-int
 rb_is_attrset_sym(VALUE sym)
 {
     return is_attrset_sym(sym);
-}
-
-int
-rb_is_local_sym(VALUE sym)
-{
-    return is_local_sym(sym);
-}
-
-int
-rb_is_junk_sym(VALUE sym)
-{
-    return is_junk_sym(sym);
 }
 
 /**
@@ -1001,6 +1010,18 @@ rb_check_id(volatile VALUE *namep)
     return lookup_str_id(name);
 }
 
+/**
+ * Returns Symbol for the given name if it is interned already, or
+ * nil.
+ *
+ * \param namep   the pointer to the name object
+ * \return        the Symbol for *namep
+ * \pre           the object referred by \p namep must be a Symbol or
+ *                a String, or possible to convert with to_str method.
+ * \post          the object referred by \p namep is a Symbol or a
+ *                String if non-nil value is returned, or is a String
+ *                if nil is returned.
+ */
 VALUE
 rb_check_symbol(volatile VALUE *namep)
 {
@@ -1064,13 +1085,11 @@ rb_check_symbol_cstr(const char *ptr, long len, rb_encoding *enc)
     return Qnil;
 }
 
-#undef rb_sym_intern_cstr
 #undef rb_sym_intern_ascii_cstr
 #ifdef __clang__
 NOINLINE(VALUE rb_sym_intern(const char *ptr, long len, rb_encoding *enc));
 #else
 FUNC_MINIMIZED(VALUE rb_sym_intern(const char *ptr, long len, rb_encoding *enc));
-FUNC_MINIMIZED(VALUE rb_sym_intern_cstr(const char *ptr, rb_encoding *enc));
 FUNC_MINIMIZED(VALUE rb_sym_intern_ascii(const char *ptr, long len));
 FUNC_MINIMIZED(VALUE rb_sym_intern_ascii_cstr(const char *ptr));
 #endif
@@ -1081,12 +1100,6 @@ rb_sym_intern(const char *ptr, long len, rb_encoding *enc)
     struct RString fake_str;
     const VALUE name = rb_setup_fake_str(&fake_str, ptr, len, enc);
     return rb_str_intern(name);
-}
-
-VALUE
-rb_sym_intern_cstr(const char *ptr, rb_encoding *enc)
-{
-    return rb_sym_intern(ptr, strlen(ptr), enc);
 }
 
 VALUE
@@ -1107,34 +1120,6 @@ rb_to_symbol_type(VALUE obj)
     return rb_convert_type_with_id(obj, T_SYMBOL, "Symbol", idTo_sym);
 }
 
-static ID
-attrsetname_to_attr_id(VALUE name)
-{
-    ID id;
-    struct RString fake_str;
-    /* make local name by chopping '=' */
-    const VALUE localname = rb_setup_fake_str(&fake_str,
-					      RSTRING_PTR(name), RSTRING_LEN(name) - 1,
-					      rb_enc_get(name));
-    OBJ_FREEZE(localname);
-
-    if ((id = lookup_str_id(localname)) != 0) {
-	return id;
-    }
-    RB_GC_GUARD(name);
-    return (ID)0;
-}
-
-static ID
-attrsetname_to_attr(VALUE name)
-{
-    if (rb_is_attrset_name(name)) {
-	return attrsetname_to_attr_id(name);
-    }
-
-    return (ID)0;
-}
-
 int
 rb_is_const_name(VALUE name)
 {
@@ -1148,43 +1133,15 @@ rb_is_class_name(VALUE name)
 }
 
 int
-rb_is_global_name(VALUE name)
-{
-    return rb_str_symname_type(name, 0) == ID_GLOBAL;
-}
-
-int
 rb_is_instance_name(VALUE name)
 {
     return rb_str_symname_type(name, 0) == ID_INSTANCE;
 }
 
 int
-rb_is_attrset_name(VALUE name)
-{
-    return rb_str_symname_type(name, IDSET_ATTRSET_FOR_INTERN) == ID_ATTRSET;
-}
-
-int
 rb_is_local_name(VALUE name)
 {
     return rb_str_symname_type(name, 0) == ID_LOCAL;
-}
-
-int
-rb_is_method_name(VALUE name)
-{
-    switch (rb_str_symname_type(name, 0)) {
-      case ID_LOCAL: case ID_ATTRSET: case ID_JUNK:
-	return TRUE;
-    }
-    return FALSE;
-}
-
-int
-rb_is_junk_name(VALUE name)
-{
-    return rb_str_symname_type(name, IDSET_ATTRSET_FOR_SYNTAX) == -1;
 }
 
 #include "id_table.c"

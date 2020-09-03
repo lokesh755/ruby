@@ -3,9 +3,11 @@ require 'rubygems/test_case'
 require 'rubygems/commands/push_command'
 
 class TestGemCommandsPushCommand < Gem::TestCase
-
   def setup
     super
+
+    credential_setup
+
     ENV["RUBYGEMS_HOST"] = nil
     Gem.host = Gem::DEFAULT_HOST
     Gem.configuration.disable_default_gem_server = false
@@ -27,25 +29,23 @@ class TestGemCommandsPushCommand < Gem::TestCase
 
     @cmd = Gem::Commands::PushCommand.new
 
-    class << Gem
-
+    singleton_gem_class.class_eval do
       alias_method :orig_latest_rubygems_version, :latest_rubygems_version
 
       def latest_rubygems_version
         Gem.rubygems_version
       end
-
     end
   end
 
   def teardown
+    credential_teardown
+
     super
 
-    class << Gem
-
+    singleton_gem_class.class_eval do
       remove_method :latest_rubygems_version
       alias_method :latest_rubygems_version, :orig_latest_rubygems_version
-
     end
   end
 
@@ -250,7 +250,7 @@ class TestGemCommandsPushCommand < Gem::TestCase
       spec.metadata['allowed_push_host'] = "https://privategemserver.example"
     end
 
-    response = %{ERROR:  "#{@host}" is not allowed by the gemspec, which only allows "https://privategemserver.example"}
+    response = %(ERROR:  "#{@host}" is not allowed by the gemspec, which only allows "https://privategemserver.example")
 
     assert_raises Gem::MockGemUi::TermError do
       send_battery
@@ -359,7 +359,7 @@ class TestGemCommandsPushCommand < Gem::TestCase
     end
     Gem.configuration.load_api_keys
 
-    @cmd.handle_options %w(-k other)
+    @cmd.handle_options %w[-k other]
     @cmd.instance_variable_set :@host, @host
     @cmd.send_gem(@path)
 
@@ -404,4 +404,9 @@ class TestGemCommandsPushCommand < Gem::TestCase
     assert_equal '111111', @fetcher.last_request['OTP']
   end
 
+  private
+
+  def singleton_gem_class
+    class << Gem; self; end
+  end
 end

@@ -1,5 +1,6 @@
+#--
 #
-# $Id: 5e1871defa15d288d2252e6a76bb2c4cf2119ed3 $
+#
 #
 # Copyright (c) 1999-2006 Minero Aoki
 #
@@ -8,6 +9,7 @@
 # the GNU LGPL, Lesser General Public License version 2.1.
 # For details of the GNU LGPL, see the file "COPYING".
 #
+#++
 
 require 'racc'
 require 'racc/compat'
@@ -427,7 +429,7 @@ module Racc
     $raccs_print_type = false
 
     def scan_action
-      buf = ''
+      buf = String.new
       nest = 1
       pre = nil
       @in_block = 'action'
@@ -450,6 +452,7 @@ module Racc
             nest -= 1
             if nest == 0
               @in_block = nil
+              buf.sub!(/[ \t\f]+\z/, '')
               return buf
             end
             buf << (pre = ch)

@@ -387,6 +387,21 @@ class TestArgf < Test::Unit::TestCase
     assert_equal("foo", File.read(name+suffix))
   end
 
+  def test_inplace_bug_17117
+    assert_in_out_err(["-", @t1.path], "#{<<~"{#"}#{<<~'};'}")
+    {#
+      #!/usr/bin/ruby -pi.bak
+      BEGIN {
+        GC.start
+        arr = []
+        1000000.times { |x| arr << "fooo#{x}" }
+      }
+      puts "hello"
+    };
+    assert_equal("hello\n1\nhello\n2\n", File.read(@t1.path))
+    assert_equal("1\n2\n", File.read("#{@t1.path}.bak"))
+  end
+
   def test_encoding
     ruby('-e', "#{<<~"{#"}\n#{<<~'};'}", @t1.path, @t2.path, @t3.path) do |f|
       {#
@@ -723,6 +738,13 @@ class TestArgf < Test::Unit::TestCase
   def test_each_line_paragraph
     assert_in_out_err(['-e', 'ARGF.each_line("") {|para| p para}'], "a\n\nb\n",
                       ["\"a\\n\\n\"", "\"b\\n\""], [])
+  end
+
+  def test_each_line_chomp
+    assert_in_out_err(['-e', 'ARGF.each_line(chomp: false) {|para| p para}'], "a\nb\n",
+                      ["\"a\\n\"", "\"b\\n\""], [])
+    assert_in_out_err(['-e', 'ARGF.each_line(chomp: true) {|para| p para}'], "a\nb\n",
+                      ["\"a\"", "\"b\""], [])
   end
 
   def test_each_byte

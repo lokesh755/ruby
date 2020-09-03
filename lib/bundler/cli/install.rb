@@ -12,8 +12,6 @@ module Bundler
 
       warn_if_root
 
-      normalize_groups
-
       Bundler::SharedHelpers.set_env "RB_USER_INSTALL", "1" if Bundler::FREEBSD
 
       # Disable color in deployment mode
@@ -38,7 +36,8 @@ module Bundler
         if Bundler.feature_flag.deployment_means_frozen?
           Bundler.settings.set_command_option :deployment, true
         else
-          Bundler.settings.set_command_option :frozen, true
+          Bundler.settings.set_command_option :deployment, true if options[:deployment]
+          Bundler.settings.set_command_option :frozen, true if options[:frozen]
         end
       end
 
@@ -151,25 +150,24 @@ module Bundler
 
       check_for_group_conflicts_in_cli_options
 
-      Bundler.settings.set_command_option :with, nil if options[:with] == []
-      Bundler.settings.set_command_option :without, nil if options[:without] == []
-
       with = options.fetch(:with, [])
       with |= Bundler.settings[:with].map(&:to_s)
       with -= options[:without] if options[:without]
+      with = nil if options[:with] == []
 
       without = options.fetch(:without, [])
       without |= Bundler.settings[:without].map(&:to_s)
       without -= options[:with] if options[:with]
+      without = nil if options[:without] == []
 
-      options[:with]    = with
-      options[:without] = without
+      Bundler.settings.set_command_option :without, without
+      Bundler.settings.set_command_option :with,    with
     end
 
     def normalize_settings
       Bundler.settings.set_command_option :path, nil if options[:system]
       Bundler.settings.temporary(:path_relative_to_cwd => false) do
-        Bundler.settings.set_command_option :path, "vendor/bundle" if options[:deployment]
+        Bundler.settings.set_command_option :path, "vendor/bundle" if Bundler.settings[:deployment] && Bundler.settings[:path].nil?
       end
       Bundler.settings.set_command_option_if_given :path, options[:path]
       Bundler.settings.temporary(:path_relative_to_cwd => false) do
@@ -190,13 +188,7 @@ module Bundler
 
       Bundler.settings.set_command_option_if_given :clean, options["clean"]
 
-      unless Bundler.settings[:without] == options[:without] && Bundler.settings[:with] == options[:with]
-        # need to nil them out first to get around validation for backwards compatibility
-        Bundler.settings.set_command_option :without, nil
-        Bundler.settings.set_command_option :with,    nil
-        Bundler.settings.set_command_option :without, options[:without] - options[:with]
-        Bundler.settings.set_command_option :with,    options[:with]
-      end
+      normalize_groups if options[:without] || options[:with]
 
       options[:force] = options[:redownload]
     end

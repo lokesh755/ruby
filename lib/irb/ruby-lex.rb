@@ -10,14 +10,17 @@
 #
 #
 
-require "e2mmap"
 require "ripper"
+require "jruby" if RUBY_ENGINE == "jruby"
 
 # :stopdoc:
 class RubyLex
 
-  extend Exception2MessageMapper
-  def_exception(:TerminateLineInput, "Terminate Line Input")
+  class TerminateLineInput < StandardError
+    def initialize
+      super("Terminate Line Input")
+    end
+  end
 
   def initialize
     @exp_line_no = @line_no = 1
@@ -25,6 +28,18 @@ class RubyLex
     @continue = false
     @line = ""
     @prompt = nil
+  end
+
+  def self.compile_with_errors_suppressed(code)
+    line_no = 1
+    begin
+      result = yield code, line_no
+    rescue ArgumentError
+      code = ";\n#{code}"
+      line_no = 0
+      result = yield code, line_no
+    end
+    result
   end
 
   # io functions
@@ -71,20 +86,30 @@ class RubyLex
     end
   end
 
+  def ripper_lex_without_warning(code)
+    verbose, $VERBOSE = $VERBOSE, nil
+    tokens = nil
+    self.class.compile_with_errors_suppressed(code) do |inner_code, line_no|
+      tokens = Ripper.lex(inner_code, '-', line_no)
+    end
+    $VERBOSE = verbose
+    tokens
+  end
+
   def set_auto_indent(context)
     if @io.respond_to?(:auto_indent) and context.auto_indent_mode
       @io.auto_indent do |lines, line_index, byte_pointer, is_newline|
         if is_newline
           md = lines[line_index - 1].match(/(\A +)/)
           prev_spaces = md.nil? ? 0 : md[1].count(' ')
-          @tokens = Ripper.lex(lines[0..line_index].join("\n"))
+          @tokens = ripper_lex_without_warning(lines[0..line_index].join("\n"))
           depth_difference = check_newline_depth_difference
           prev_spaces + depth_difference * 2
         else
           code = line_index.zero? ? '' : lines[0..(line_index - 1)].map{ |l| l + "\n" }.join
           last_line = lines[line_index]&.byteslice(0, byte_pointer)
           code += last_line if last_line
-          @tokens = Ripper.lex(code)
+          @tokens = ripper_lex_without_warning(code)
           corresponding_token_depth = check_corresponding_token_depth
           if corresponding_token_depth
             corresponding_token_depth
@@ -97,7 +122,7 @@ class RubyLex
   end
 
   def check_state(code)
-    @tokens = Ripper.lex(code)
+    @tokens = ripper_lex_without_warning(code)
     ltype = process_literal_type
     indent = process_nesting_level
     continue = process_continue
@@ -160,7 +185,7 @@ class RubyLex
     end
     code = @line + (line.nil? ? '' : line)
     code.gsub!(/\s*\z/, '').concat("\n")
-    @tokens = Ripper.lex(code)
+    @tokens = ripper_lex_without_warning(code)
     @continue = process_continue
     @code_block_open = check_code_block(code)
     @indent = process_nesting_level
@@ -176,15 +201,6 @@ class RubyLex
     elsif @tokens.size >= 2 and @tokens[-2][1] == :on_semicolon
       return false
     elsif @tokens.size >= 2 and @tokens[-2][1] == :on_kw and ['begin', 'else', 'ensure'].include?(@tokens[-2][2])
-      return false
-    elsif @tokens.size >= 3 and @tokens[-3][1] == :on_symbeg and @tokens[-2][1] == :on_ivar
-      # This is for :@a or :@1 because :@1 ends with EXPR_FNAME
-      return false
-    elsif @tokens.size >= 2 and @tokens[-2][1] == :on_ivar and @tokens[-2][2] =~ /\A@\d+\z/
-      # This is for @1
-      return false
-    elsif @tokens.size >= 2 and @tokens[-2][1] == :on_cvar and @tokens[-1][1] == :on_int
-      # This is for @@1 or :@@1 and ends with on_int because it's syntax error
       return false
     elsif !@tokens.empty? and @tokens.last[2] == "\\\n"
       return true
@@ -209,8 +225,12 @@ class RubyLex
       when 'jruby'
         JRuby.compile_ir(code)
       else
-        RubyVM::InstructionSequence.compile(code)
+        self.class.compile_with_errors_suppressed(code) do |inner_code, line_no|
+          RubyVM::InstructionSequence.compile(inner_code, nil, nil, line_no)
+        end
       end
+    rescue EncodingError
+      # This is for a hash with invalid encoding symbol, {"\xAE": 1}
     rescue SyntaxError => e
       case e.message
       when /unterminated (?:string|regexp) meets end of file/
@@ -256,12 +276,6 @@ class RubyLex
         #   example:
         #     method / f /
         return false
-      when /numbered parameter outside block/
-        # "numbered parameter outside block"
-        #
-        #   example:
-        #     :@1
-        return false
       end
     ensure
       $VERBOSE = verbose
@@ -289,19 +303,52 @@ class RubyLex
 
   def process_nesting_level
     indent = 0
+    in_oneliner_def = nil
     @tokens.each_with_index { |t, index|
+      # detecting one-liner method definition
+      if in_oneliner_def.nil?
+        if t[3].allbits?(Ripper::EXPR_ENDFN)
+          in_oneliner_def = :ENDFN
+        end
+      else
+        if t[3].allbits?(Ripper::EXPR_ENDFN)
+          # continuing
+        elsif t[3].allbits?(Ripper::EXPR_BEG)
+          if t[2] == '='
+            in_oneliner_def = :BODY
+          end
+        elsif t[3].allbits?(Ripper::EXPR_END)
+          if in_oneliner_def == :BODY
+            # one-liner method definition
+            indent -= 1
+          end
+          in_oneliner_def = nil
+        else
+          in_oneliner_def = nil
+        end
+      end
+
       case t[1]
-      when :on_lbracket, :on_lbrace, :on_lparen
+      when :on_lbracket, :on_lbrace, :on_lparen, :on_tlambeg
         indent += 1
       when :on_rbracket, :on_rbrace, :on_rparen
         indent -= 1
       when :on_kw
         next if index > 0 and @tokens[index - 1][3].allbits?(Ripper::EXPR_FNAME)
         case t[2]
-        when 'def', 'do', 'case', 'for', 'begin', 'class', 'module'
+        when 'do'
+          if index > 0 and @tokens[index - 1][3].anybits?(Ripper::EXPR_CMDARG | Ripper::EXPR_ENDFN | Ripper::EXPR_ARG)
+            # method_with_block do; end
+            indent += 1
+          else
+            # while cond do; end # also "until" or "for"
+            # This "do" doesn't increment indent because "while" already
+            # incremented.
+          end
+        when 'def', 'case', 'for', 'begin', 'class', 'module'
           indent += 1
         when 'if', 'unless', 'while', 'until'
-          # postfix if/unless/while/until/rescue must be Ripper::EXPR_LABEL
+          # postfix if/unless/while/until must be Ripper::EXPR_LABEL
           indent += 1 unless t[3].allbits?(Ripper::EXPR_LABEL)
         when 'end'
           indent -= 1
@@ -314,32 +361,68 @@ class RubyLex
 
   def check_newline_depth_difference
     depth_difference = 0
+    open_brace_on_line = 0
+    in_oneliner_def = nil
     @tokens.each_with_index do |t, index|
+      # detecting one-liner method definition
+      if in_oneliner_def.nil?
+        if t[3].allbits?(Ripper::EXPR_ENDFN)
+          in_oneliner_def = :ENDFN
+        end
+      else
+        if t[3].allbits?(Ripper::EXPR_ENDFN)
+          # continuing
+        elsif t[3].allbits?(Ripper::EXPR_BEG)
+          if t[2] == '='
+            in_oneliner_def = :BODY
+          end
+        elsif t[3].allbits?(Ripper::EXPR_END)
+          if in_oneliner_def == :BODY
+            # one[-liner method definition
+            depth_difference -= 1
+          end
+          in_oneliner_def = nil
+        else
+          in_oneliner_def = nil
+        end
+      end
+
       case t[1]
-      when :on_ignored_nl, :on_nl
+      when :on_ignored_nl, :on_nl, :on_comment
         if index != (@tokens.size - 1)
           depth_difference = 0
+          open_brace_on_line = 0
         end
         next
       when :on_sp
         next
       end
       case t[1]
-      when :on_lbracket, :on_lbrace, :on_lparen
+      when :on_lbracket, :on_lbrace, :on_lparen, :on_tlambeg
         depth_difference += 1
+        open_brace_on_line += 1
       when :on_rbracket, :on_rbrace, :on_rparen
-        depth_difference -= 1
+        depth_difference -= 1 if open_brace_on_line > 0
       when :on_kw
         next if index > 0 and @tokens[index - 1][3].allbits?(Ripper::EXPR_FNAME)
         case t[2]
-        when 'def', 'do', 'case', 'for', 'begin', 'class', 'module'
+        when 'do'
+          if index > 0 and @tokens[index - 1][3].anybits?(Ripper::EXPR_CMDARG | Ripper::EXPR_ENDFN | Ripper::EXPR_ARG)
+            # method_with_block do; end
+            depth_difference += 1
+          else
+            # while cond do; end # also "until" or "for"
+            # This "do" doesn't increment indent because "while" already
+            # incremented.
+          end
+        when 'def', 'case', 'for', 'begin', 'class', 'module'
           depth_difference += 1
-        when 'if', 'unless', 'while', 'until'
+        when 'if', 'unless', 'while', 'until', 'rescue'
           # postfix if/unless/while/until/rescue must be Ripper::EXPR_LABEL
           unless t[3].allbits?(Ripper::EXPR_LABEL)
             depth_difference += 1
           end
-        when 'else', 'elsif', 'rescue', 'ensure', 'when', 'in'
+        when 'else', 'elsif', 'ensure', 'when', 'in'
           depth_difference += 1
         end
       end
@@ -353,13 +436,44 @@ class RubyLex
     is_first_printable_of_line = true
     spaces_of_nest = []
     spaces_at_line_head = 0
+    open_brace_on_line = 0
+    in_oneliner_def = nil
     @tokens.each_with_index do |t, index|
-      corresponding_token_depth = nil
+      # detecting one-liner method definition
+      if in_oneliner_def.nil?
+        if t[3].allbits?(Ripper::EXPR_ENDFN)
+          in_oneliner_def = :ENDFN
+        end
+      else
+        if t[3].allbits?(Ripper::EXPR_ENDFN)
+          # continuing
+        elsif t[3].allbits?(Ripper::EXPR_BEG)
+          if t[2] == '='
+            in_oneliner_def = :BODY
+          end
+        elsif t[3].allbits?(Ripper::EXPR_END)
+          if in_oneliner_def == :BODY
+            # one-liner method definition
+            if is_first_printable_of_line
+              corresponding_token_depth = spaces_of_nest.pop
+            else
+              spaces_of_nest.pop
+              corresponding_token_depth = nil
+            end
+          end
+          in_oneliner_def = nil
+        else
+          in_oneliner_def = nil
+        end
+      end
+
       case t[1]
-      when :on_ignored_nl, :on_nl
+      when :on_ignored_nl, :on_nl, :on_comment
+        corresponding_token_depth = nil
         spaces_at_line_head = 0
         is_first_spaces_of_line = true
         is_first_printable_of_line = true
+        open_brace_on_line = 0
         next
       when :on_sp
         spaces_at_line_head = t[2].count(' ') if is_first_spaces_of_line
@@ -367,8 +481,9 @@ class RubyLex
         next
       end
       case t[1]
-      when :on_lbracket, :on_lbrace, :on_lparen
-        spaces_of_nest.push(spaces_at_line_head)
+      when :on_lbracket, :on_lbrace, :on_lparen, :on_tlambeg
+        spaces_of_nest.push(spaces_at_line_head + open_brace_on_line * 2)
+        open_brace_on_line += 1
       when :on_rbracket, :on_rbrace, :on_rparen
         if is_first_printable_of_line
           corresponding_token_depth = spaces_of_nest.pop
@@ -376,17 +491,22 @@ class RubyLex
           spaces_of_nest.pop
           corresponding_token_depth = nil
         end
+        open_brace_on_line -= 1
       when :on_kw
         next if index > 0 and @tokens[index - 1][3].allbits?(Ripper::EXPR_FNAME)
         case t[2]
         when 'def', 'do', 'case', 'for', 'begin', 'class', 'module'
           spaces_of_nest.push(spaces_at_line_head)
+        when 'rescue'
+          unless t[3].allbits?(Ripper::EXPR_LABEL)
+            corresponding_token_depth = spaces_of_nest.last
+          end
         when 'if', 'unless', 'while', 'until'
-          # postfix if/unless/while/until/rescue must be Ripper::EXPR_LABEL
+          # postfix if/unless/while/until must be Ripper::EXPR_LABEL
           unless t[3].allbits?(Ripper::EXPR_LABEL)
             spaces_of_nest.push(spaces_at_line_head)
           end
-        when 'else', 'elsif', 'rescue', 'ensure', 'when', 'in'
+        when 'else', 'elsif', 'ensure', 'when', 'in'
           corresponding_token_depth = spaces_of_nest.last
         when 'end'
           if is_first_printable_of_line

@@ -20,11 +20,16 @@ module Bundler
         @allow_cached = false
         @allow_remote = false
 
-        @root_path = options["root_path"] || Bundler.root
+        @root_path = options["root_path"] || root
 
         if options["path"]
           @path = Pathname.new(options["path"])
-          @path = expand(@path) unless @path.relative?
+          expanded_path = expand(@path)
+          @path = if @path.relative?
+            expanded_path.relative_path_from(root_path.expand_path)
+          else
+            expanded_path
+          end
         end
 
         @name    = options["name"]
@@ -127,7 +132,11 @@ module Bundler
       end
 
       def expand(somepath)
-        somepath.expand_path(root_path)
+        if Bundler.current_ruby.jruby? # TODO: Unify when https://github.com/rubygems/bundler/issues/7598 fixed upstream and all supported jrubies include the fix
+          somepath.expand_path(root_path).expand_path
+        else
+          somepath.expand_path(root_path)
+        end
       rescue ArgumentError => e
         Bundler.ui.debug(e)
         raise PathError, "There was an error while trying to use the path " \
@@ -136,7 +145,7 @@ module Bundler
 
       def lockfile_path
         return relative_path(original_path) if original_path.absolute?
-        expand(original_path).relative_path_from(Bundler.root)
+        expand(original_path).relative_path_from(root)
       end
 
       def app_cache_path(custom_path = nil)

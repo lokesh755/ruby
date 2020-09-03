@@ -1,5 +1,6 @@
+#--
 #
-# $Id: de638608cfd72d3ed9819d87b65a89ee6a57b589 $
+#
 #
 # Copyright (c) 1999-2006 Minero Aoki
 #
@@ -8,6 +9,7 @@
 # the GNU LGPL, Lesser General Public License version 2.1.
 # For details of the GNU LGPL, see the file "COPYING".
 #
+#++
 
 module Racc
 

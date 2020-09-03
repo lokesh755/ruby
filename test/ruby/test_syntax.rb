@@ -93,11 +93,49 @@ class TestSyntax < Test::Unit::TestCase
     assert_valid_syntax("tap (proc do end)", __FILE__, bug9726)
   end
 
-  def test_methodref_literal
-    assert_separately [], <<-EOS
-      eval 'nil.:|;1'
-      1000.times{eval 'nil.:|;1'}
-    EOS
+  def test_hash_kwsplat_hash
+    kw = {}
+    h = {a: 1}
+    assert_equal({}, {**{}})
+    assert_equal({}, {**kw})
+    assert_equal(h, {**h})
+    assert_equal(false, {**{}}.frozen?)
+    assert_equal(false, {**kw}.equal?(kw))
+    assert_equal(false, {**h}.equal?(h))
+  end
+
+  def test_array_kwsplat_hash
+    kw = {}
+    h = {a: 1}
+    assert_equal([], [**{}])
+    assert_equal([], [**kw])
+    assert_equal([h], [**h])
+    assert_equal([{}], [{}])
+    assert_equal([kw], [kw])
+    assert_equal([h], [h])
+
+    assert_equal([1], [1, **{}])
+    assert_equal([1], [1, **kw])
+    assert_equal([1, h], [1, **h])
+    assert_equal([1, {}], [1, {}])
+    assert_equal([1, kw], [1, kw])
+    assert_equal([1, h], [1, h])
+
+    assert_equal([], [**kw, **kw])
+    assert_equal([], [**kw, **{}, **kw])
+    assert_equal([1], [1, **kw, **{}, **kw])
+
+    assert_equal([{}], [{}, **kw, **kw])
+    assert_equal([kw], [kw, **kw, **kw])
+    assert_equal([h], [h, **kw, **kw])
+    assert_equal([h, h], [h, **kw, **kw, **h])
+
+    assert_equal([h, {:a=>2}], [h, **{}, **h, a: 2])
+    assert_equal([h, h], [h, **{}, a: 2, **h])
+    assert_equal([h, h], [h, a: 2, **{}, **h])
+    assert_equal([h, h], [h, a: 2, **h, **{}])
+    assert_equal([h, {:a=>2}], [h, **h, a: 2, **{}])
+    assert_equal([h, {:a=>2}], [h, **h, **{}, a: 2])
   end
 
   def test_normal_argument
@@ -155,7 +193,7 @@ class TestSyntax < Test::Unit::TestCase
     h = {k3: 31}
     assert_raise(ArgumentError) {o.kw(**h)}
     h = {"k1"=>11, k2: 12}
-    assert_raise(TypeError) {o.kw(**h)}
+    assert_raise(ArgumentError) {o.kw(**h)}
   end
 
   def test_keyword_duplicated
@@ -170,7 +208,7 @@ class TestSyntax < Test::Unit::TestCase
     assert_equal([1, 2], a, bug10315)
     a.clear
     r = nil
-    assert_warn(/duplicated/) {r = eval("a.f({k: a.add(1), k: a.add(2)})")}
+    assert_warn(/duplicated/) {r = eval("a.f(**{k: a.add(1), k: a.add(2)})")}
     assert_equal(2, r)
     assert_equal([1, 2], a, bug10315)
   end
@@ -194,33 +232,25 @@ class TestSyntax < Test::Unit::TestCase
   end
 
   def test_keyword_self_reference
-    bug9593 = '[ruby-core:61299] [Bug #9593]'
-    o = Object.new
-    assert_warn(/circular argument reference - var/) do
-      o.instance_eval("def foo(var: defined?(var)) var end")
-    end
-    assert_equal(42, o.foo(var: 42))
-    assert_equal("local-variable", o.foo, bug9593)
-
-    o = Object.new
-    assert_warn(/circular argument reference - var/) do
-      o.instance_eval("def foo(var: var) var end")
-    end
-    assert_nil(o.foo, bug9593)
-
-    o = Object.new
-    assert_warn(/circular argument reference - var/) do
-      o.instance_eval("def foo(var: bar(var)) var end")
-    end
-
-    o = Object.new
-    assert_warn(/circular argument reference - var/) do
-      o.instance_eval("def foo(var: bar {var}) var end")
-    end
+    message = /circular argument reference - var/
+    assert_syntax_error("def foo(var: defined?(var)) var end", message)
+    assert_syntax_error("def foo(var: var) var end", message)
+    assert_syntax_error("def foo(var: bar(var)) var end", message)
+    assert_syntax_error("def foo(var: bar {var}) var end", message)
 
     o = Object.new
     assert_warn("") do
       o.instance_eval("def foo(var: bar {|var| var}) var end")
+    end
+
+    o = Object.new
+    assert_warn("") do
+      o.instance_eval("def foo(var: bar {| | var}) var end")
+    end
+
+    o = Object.new
+    assert_warn("") do
+      o.instance_eval("def foo(var: bar {|| var}) var end")
     end
 
     o = Object.new
@@ -237,56 +267,55 @@ class TestSyntax < Test::Unit::TestCase
   def test_keyword_invalid_name
     bug11663 = '[ruby-core:71356] [Bug #11663]'
 
-    o = o = Object.new
-    assert_syntax_error('def o.foo(arg1?:) end', /arg1\?/, bug11663)
-    assert_syntax_error('def o.foo(arg1?:, arg2:) end', /arg1\?/, bug11663)
+    assert_syntax_error('def foo(arg1?:) end', /arg1\?/, bug11663)
+    assert_syntax_error('def foo(arg1?:, arg2:) end', /arg1\?/, bug11663)
     assert_syntax_error('proc {|arg1?:|}', /arg1\?/, bug11663)
     assert_syntax_error('proc {|arg1?:, arg2:|}', /arg1\?/, bug11663)
 
     bug10545 = '[ruby-dev:48742] [Bug #10545]'
-    assert_syntax_error('def o.foo(FOO: a) end', /constant/, bug10545)
-    assert_syntax_error('def o.foo(@foo: a) end', /instance variable/)
-    assert_syntax_error('def o.foo(@@foo: a) end', /class variable/)
+    assert_syntax_error('def foo(FOO: a) end', /constant/, bug10545)
+    assert_syntax_error('def foo(@foo: a) end', /instance variable/)
+    assert_syntax_error('def foo(@@foo: a) end', /class variable/)
+  end
+
+  def test_keywords_specified_and_not_accepted
+    assert_syntax_error('def foo(a:, **nil) end', /unexpected/)
+    assert_syntax_error('def foo(a:, **nil, &b) end', /unexpected/)
+    assert_syntax_error('def foo(**a, **nil) end', /unexpected/)
+    assert_syntax_error('def foo(**a, **nil, &b) end', /unexpected/)
+    assert_syntax_error('def foo(**nil, **a) end', /unexpected/)
+    assert_syntax_error('def foo(**nil, **a, &b) end', /unexpected/)
+
+    assert_syntax_error('proc do |a:, **nil| end', /unexpected/)
+    assert_syntax_error('proc do |a:, **nil, &b| end', /unexpected/)
+    assert_syntax_error('proc do |**a, **nil| end', /unexpected/)
+    assert_syntax_error('proc do |**a, **nil, &b| end', /unexpected/)
+    assert_syntax_error('proc do |**nil, **a| end', /unexpected/)
+    assert_syntax_error('proc do |**nil, **a, &b| end', /unexpected/)
   end
 
   def test_optional_self_reference
-    bug9593 = '[ruby-core:61299] [Bug #9593]'
-    o = Object.new
-    assert_warn(/circular argument reference - var/) do
-      o.instance_eval("def foo(var = defined?(var)) var end")
-    end
-    assert_equal(42, o.foo(42))
-    assert_equal("local-variable", o.foo, bug9593)
-
-    o = Object.new
-    assert_warn(/circular argument reference - var/) do
-      o.instance_eval("def foo(var = var) var end")
-    end
-    assert_nil(o.foo, bug9593)
-
-    o = Object.new
-    assert_warn(/circular argument reference - var/) do
-      o.instance_eval("def foo(var = bar(var)) var end")
-    end
-
-    o = Object.new
-    assert_warn(/circular argument reference - var/) do
-      o.instance_eval("def foo(var = bar {var}) var end")
-    end
-
-    o = Object.new
-    assert_warn(/circular argument reference - var/) do
-      o.instance_eval("def foo(var = (def bar;end; var)) var end")
-    end
-
-    o = Object.new
-    assert_warn(/circular argument reference - var/) do
-      o.instance_eval("def foo(var = (def self.bar;end; var)) var end")
-    end
+    message = /circular argument reference - var/
+    assert_syntax_error("def foo(var = defined?(var)) var end", message)
+    assert_syntax_error("def foo(var = var) var end", message)
+    assert_syntax_error("def foo(var = bar(var)) var end", message)
+    assert_syntax_error("def foo(var = bar {var}) var end", message)
+    assert_syntax_error("def foo(var = (def bar;end; var)) var end", message)
+    assert_syntax_error("def foo(var = (def self.bar;end; var)) var end", message)
 
     o = Object.new
     assert_warn("") do
       o.instance_eval("def foo(var = bar {|var| var}) var end")
+    end
+
+    o = Object.new
+    assert_warn("") do
+      o.instance_eval("def foo(var = bar {| | var}) var end")
+    end
+
+    o = Object.new
+    assert_warn("") do
+      o.instance_eval("def foo(var = bar {|| var}) var end")
     end
 
     o = Object.new
@@ -600,7 +629,7 @@ WARN
   def test_unassignable
     gvar = global_variables
     %w[self nil true false __FILE__ __LINE__ __ENCODING__].each do |kwd|
-      assert_raise(SyntaxError) {eval("#{kwd} = nil")}
+      assert_syntax_error("#{kwd} = nil", /Can't .* #{kwd}$/)
       assert_equal(gvar, global_variables)
     end
   end
@@ -931,9 +960,14 @@ eom
 
   def test_warning_for_cr
     feature8699 = '[ruby-core:56240] [Feature #8699]'
-    assert_warning(/encountered \\r/, feature8699) do
-      eval("\r""__id__\r")
+    s = assert_warning(/encountered \\r/, feature8699) do
+      eval("'\r'\r")
     end
+    assert_equal("\r", s)
+    s = assert_warning('') do
+      eval("'\r'\r\n")
+    end
+    assert_equal("\r", s)
   end
 
   def test_unexpected_fraction
@@ -959,6 +993,13 @@ eom
     assert_syntax_error('0...%q.', /unterminated string/, bug10957)
   end
 
+  def test_range_at_eol
+    assert_warn(/\.\.\. at EOL/) {eval("1...\n2")}
+    assert_warn('') {eval("(1...)")}
+    assert_warn('') {eval("(1...\n2)")}
+    assert_warn('') {eval("{a: 1...\n2}")}
+  end
+
   def test_too_big_nth_ref
     bug11192 = '[ruby-core:69393] [Bug #11192]'
     assert_warn(/too big/, bug11192) do
@@ -980,7 +1021,8 @@ eom
   def test_fluent_dot
     assert_valid_syntax("a\n.foo")
     assert_valid_syntax("a\n&.foo")
-    assert_valid_syntax("a\n.:foo")
+    assert_valid_syntax("a #\n#\n.foo\n")
+    assert_valid_syntax("a #\n#\n&.foo\n")
   end
 
   def test_safe_call_in_massign_lhs
@@ -1006,9 +1048,6 @@ eom
     end
     assert_warn(/literal in condition/) do
       eval('1 if //')
-    end
-    assert_warn(/literal in condition/) do
-      eval('1 if true..false')
     end
     assert_warning(/literal in condition/) do
       eval('1 if 1')
@@ -1037,6 +1076,27 @@ eom
     end
     assert_warning('') do
       eval('1 if !:"#{"foo".upcase}"')
+    end
+  end
+
+  def test_warning_literal_in_flip_flop
+    assert_warn(/literal in flip-flop/) do
+      eval('1 if ""..false')
+    end
+    assert_warning(/literal in flip-flop/) do
+      eval('1 if :foo..false')
+    end
+    assert_warning(/literal in flip-flop/) do
+      eval('1 if :"#{"foo".upcase}"..false')
+    end
+    assert_warn(/literal in flip-flop/) do
+      eval('1 if ""...false')
+    end
+    assert_warning(/literal in flip-flop/) do
+      eval('1 if :foo...false')
+    end
+    assert_warning(/literal in flip-flop/) do
+      eval('1 if :"#{"foo".upcase}"...false')
     end
   end
 
@@ -1199,6 +1259,10 @@ eom
     assert_warn(/argument of top-level return is ignored/) {eval("return 1")}
   end
 
+  def test_return_in_proc_in_class
+    assert_in_out_err(['-e', 'class TestSyntax; proc{ return }.call; end'], "", [], /^-e:1:.*unexpected return \(LocalJumpError\)/)
+  end
+
   def test_syntax_error_in_rescue
     bug12613 = '[ruby-core:76531] [Bug #12613]'
     assert_syntax_error("#{<<-"begin;"}\n#{<<-"end;"}", /Invalid retry/, bug12613)
@@ -1350,6 +1414,24 @@ eom
     assert_equal(line, e.backtrace_locations[0].lineno)
   end
 
+  def test_methoddef_endless
+    assert_syntax_error('private def foo = 42', /unexpected '='/)
+    assert_valid_syntax('private def foo() = 42')
+    assert_valid_syntax('private def inc(x) = x + 1')
+    assert_syntax_error('private def obj.foo = 42', /unexpected '='/)
+    assert_valid_syntax('private def obj.foo() = 42')
+    assert_valid_syntax('private def obj.inc(x) = x + 1')
+    eval('def self.inc(x) = x + 1 => @x')
+    assert_equal(:inc, @x)
+    k = Class.new do
+      class_eval('def rescued(x) = raise("to be caught") rescue "instance #{x}"')
+      class_eval('def self.rescued(x) = raise("to be caught") rescue "class #{x}"')
+    end
+    assert_equal("class ok", k.rescued("ok"))
+    assert_equal("instance ok", k.new.rescued("ok"))
+    assert_syntax_error('def foo=() = 42', /setter method cannot be defined in an endless method definition/)
+  end
+
   def test_methoddef_in_cond
     assert_valid_syntax('while def foo; tap do end; end; break; end')
     assert_valid_syntax('while def foo a = tap do end; end; break; end')
@@ -1366,35 +1448,48 @@ eom
   end
 
   def test_numbered_parameter
-    assert_valid_syntax('proc {@1}')
-    assert_equal(3, eval('[1,2].then {@1+@2}'))
-    assert_equal("12", eval('[1,2].then {"#@1#@2"}'))
-    assert_equal(3, eval('->{@1+@2}.call(1,2)'))
-    assert_equal(4, eval('->(a=->{@1}){a}.call.call(4)'))
-    assert_equal(5, eval('-> a: ->{@1} {a}.call.call(5)'))
-    assert_syntax_error('proc {|| @1}', /ordinary parameter is defined/)
-    assert_syntax_error('proc {|;a| @1}', /ordinary parameter is defined/)
-    assert_syntax_error("proc {|\n| @1}", /ordinary parameter is defined/)
-    assert_syntax_error('proc {|x| @1}', /ordinary parameter is defined/)
-    assert_syntax_error('->(){@1}', /ordinary parameter is defined/)
-    assert_syntax_error('->(x){@1}', /ordinary parameter is defined/)
-    assert_syntax_error('->x{@1}', /ordinary parameter is defined/)
-    assert_syntax_error('->x:@2{}', /ordinary parameter is defined/)
-    assert_syntax_error('->x=@1{}', /ordinary parameter is defined/)
-    assert_syntax_error('proc {@1 = nil}', /Can't assign to numbered parameter @1/)
-    assert_syntax_error('proc {@01}', /leading zero/)
-    assert_syntax_error('proc {@1_}', /unexpected/)
-    assert_syntax_error('proc {@9999999999999999}', /too large/)
-    assert_syntax_error('@1', /outside block/)
-  end
+    assert_valid_syntax('proc {_1}')
+    assert_equal(3, eval('[1,2].then {_1+_2}'))
+    assert_equal("12", eval('[1,2].then {"#{_1}#{_2}"}'))
+    assert_equal([1, 2], eval('[1,2].then {_1}'))
+    assert_equal(3, eval('->{_1+_2}.call(1,2)'))
+    assert_equal(4, eval('->(a=->{_1}){a}.call.call(4)'))
+    assert_equal(5, eval('-> a: ->{_1} {a}.call.call(5)'))
+    assert_syntax_error('proc {|| _1}', /ordinary parameter is defined/)
+    assert_syntax_error('proc {|;a| _1}', /ordinary parameter is defined/)
+    assert_syntax_error("proc {|\n| _1}", /ordinary parameter is defined/)
+    assert_syntax_error('proc {|x| _1}', /ordinary parameter is defined/)
+    assert_syntax_error('proc {_1; proc {_2}}', /numbered parameter is already used/)
+    assert_syntax_error('proc {proc {_1}; _2}', /numbered parameter is already used/)
+    assert_syntax_error('->(){_1}', /ordinary parameter is defined/)
+    assert_syntax_error('->(x){_1}', /ordinary parameter is defined/)
+    assert_syntax_error('->x{_1}', /ordinary parameter is defined/)
+    assert_syntax_error('->x:_2{}', /ordinary parameter is defined/)
+    assert_syntax_error('->x=_1{}', /ordinary parameter is defined/)
+    assert_syntax_error('-> {_1; -> {_2}}', /numbered parameter is already used/)
+    assert_syntax_error('-> {-> {_1}; _2}', /numbered parameter is already used/)
+    assert_syntax_error('proc {_1; _1 = nil}', /Can't assign to numbered parameter _1/)
+    assert_syntax_error('proc {_1 = nil}', /_1 is reserved for numbered parameter/)
+    assert_syntax_error('_2=1', /_2 is reserved for numbered parameter/)
+    assert_syntax_error('proc {|_3|}', /_3 is reserved for numbered parameter/)
+    assert_syntax_error('def x(_4) end', /_4 is reserved for numbered parameter/)
+    assert_syntax_error('def _5; end', /_5 is reserved for numbered parameter/)
+    assert_syntax_error('def self._6; end', /_6 is reserved for numbered parameter/)
+    assert_raise_with_message(NameError, /undefined local variable or method `_1'/) {
+      eval('_1')
+    }
+    ['class C', 'class << C', 'module M', 'def m', 'def o.m'].each do |c|
+      assert_valid_syntax("->{#{c};->{_1};end;_1}\n")
+      assert_valid_syntax("->{_1;#{c};->{_1};end}\n")
+    end
 
-  def test_pipeline_operator
-    assert_valid_syntax('x |> y')
-    x = nil
-    assert_equal("121", eval('x = 12 |> pow(2) |> to_s 11'))
-    assert_equal(12, x)
-    assert_equal([2, 4, 6], eval("1.. |> take 3\n|> map do @1 * 2 end"))
-    assert_syntax_error('a|>-b', /unexpected '-'/)
+    1.times {
+      [
+        _1,
+        assert_equal([:a], eval("[:a].map{_1}")),
+        assert_raise(NameError) {eval("_1")},
+      ]
+    }
   end
 
   def test_value_expr_in_condition
@@ -1403,6 +1498,208 @@ eom
     assert_valid_syntax("tap {a = (true ? true : break)}")
     assert_valid_syntax("tap {a = (break if false)}")
     assert_valid_syntax("tap {a = (break unless true)}")
+  end
+
+  def test_argument_forwarding
+    assert_valid_syntax('def foo(...) bar(...) end')
+    assert_valid_syntax('def foo(...) end')
+    assert_valid_syntax('def ==(...) end')
+    assert_valid_syntax('def [](...) end')
+    assert_valid_syntax('def nil(...) end')
+    assert_valid_syntax('def true(...) end')
+    assert_valid_syntax('def false(...) end')
+    unexpected = /unexpected \.{3}/
+    assert_syntax_error('iter do |...| end', /unexpected/)
+    assert_syntax_error('iter {|...|}', /unexpected/)
+    assert_syntax_error('->... {}', unexpected)
+    assert_syntax_error('->(...) {}', unexpected)
+    assert_syntax_error('def foo(x, y, z) bar(...); end', /unexpected/)
+    assert_syntax_error('def foo(x, y, z) super(...); end', /unexpected/)
+    assert_syntax_error('def foo(...) yield(...); end', /unexpected/)
+    assert_syntax_error('def foo(...) return(...); end', /unexpected/)
+    assert_syntax_error('def foo(...) a = (...); end', /unexpected/)
+    assert_syntax_error('def foo(...) [...]; end', /unexpected/)
+    assert_syntax_error('def foo(...) foo[...]; end', /unexpected/)
+    assert_syntax_error('def foo(...) foo[...] = x; end', /unexpected/)
+    assert_syntax_error('def foo(...) foo(...) { }; end', /both block arg and actual block given/)
+    assert_syntax_error('def foo(...) defined?(...); end', /unexpected/)
+
+    obj1 = Object.new
+    def obj1.bar(*args, **kws, &block)
+      if block
+        block.call(args, kws)
+      else
+        [args, kws]
+      end
+    end
+    obj1.instance_eval('def foo(...) bar(...) end', __FILE__, __LINE__)
+
+    klass = Class.new {
+      def foo(*args, **kws, &block)
+        if block
+          block.call(args, kws)
+        else
+          [args, kws]
+        end
+      end
+    }
+    obj2 = klass.new
+    obj2.instance_eval('def foo(...) super(...) end', __FILE__, __LINE__)
+
+    obj3 = Object.new
+    def obj3.bar(*args, &block)
+      if kws = Hash.try_convert(args.last)
+        args.pop
+      else
+        kws = {}
+      end
+      if block
+        block.call(args, kws)
+      else
+        [args, kws]
+      end
+    end
+    obj3.instance_eval('def foo(...) bar(...) end', __FILE__, __LINE__)
+
+    [obj1, obj2, obj3].each do |obj|
+      assert_warning('') {
+        assert_equal([[1, 2, 3], {k1: 4, k2: 5}], obj.foo(1, 2, 3, k1: 4, k2: 5) {|*x| x})
+      }
+      assert_warning('') {
+        assert_equal([[1, 2, 3], {k1: 4, k2: 5}], obj.foo(1, 2, 3, k1: 4, k2: 5))
+      }
+      array = obj == obj3 ? [] : [{}]
+      assert_warning('') {
+        assert_equal([array, {}], obj.foo({}) {|*x| x})
+      }
+      assert_warning('') {
+        assert_equal([array, {}], obj.foo({}))
+      }
+      assert_equal(-1, obj.method(:foo).arity)
+      parameters = obj.method(:foo).parameters
+      assert_equal(:rest, parameters.dig(0, 0))
+      assert_equal(:block, parameters.dig(1, 0))
+    end
+  end
+
+  def test_argument_forwarding_with_leading_arguments
+    obj = Object.new
+    def obj.bar(*args, **kws, &block)
+      if block
+        block.call(args, kws)
+      else
+        [args, kws]
+      end
+    end
+    obj.instance_eval('def foo(_a, ...) bar(...) end', __FILE__, __LINE__)
+    assert_equal [[], {}], obj.foo(1)
+    assert_equal [[2], {}], obj.foo(1, 2)
+    assert_equal [[2, 3], {}], obj.foo(1, 2, 3)
+    assert_equal [[], {a: 1}], obj.foo(1, a: 1)
+    assert_equal [[2], {a: 1}], obj.foo(1, 2, a: 1)
+    assert_equal [[2, 3], {a: 1}], obj.foo(1, 2, 3, a: 1)
+    assert_equal [[2, 3], {a: 1}], obj.foo(1, 2, 3, a: 1){|args, kws| [args, kws]}
+
+    obj.singleton_class.send(:remove_method, :foo)
+    obj.instance_eval('def foo(...) bar(1, ...) end', __FILE__, __LINE__)
+    assert_equal [[1], {}], obj.foo
+    assert_equal [[1, 1], {}], obj.foo(1)
+    assert_equal [[1, 1, 2], {}], obj.foo(1, 2)
+    assert_equal [[1, 1, 2, 3], {}], obj.foo(1, 2, 3)
+    assert_equal [[1], {a: 1}], obj.foo(a: 1)
+    assert_equal [[1, 1], {a: 1}], obj.foo(1, a: 1)
+    assert_equal [[1, 1, 2], {a: 1}], obj.foo(1, 2, a: 1)
+    assert_equal [[1, 1, 2, 3], {a: 1}], obj.foo(1, 2, 3, a: 1)
+    assert_equal [[1, 1, 2, 3], {a: 1}], obj.foo(1, 2, 3, a: 1){|args, kws| [args, kws]}
+
+    obj.singleton_class.send(:remove_method, :foo)
+    obj.instance_eval('def foo(a, ...) bar(a, ...) end', __FILE__, __LINE__)
+    assert_equal [[4], {}], obj.foo(4)
+    assert_equal [[4, 2], {}], obj.foo(4, 2)
+    assert_equal [[4, 2, 3], {}], obj.foo(4, 2, 3)
+    assert_equal [[4], {a: 1}], obj.foo(4, a: 1)
+    assert_equal [[4, 2], {a: 1}], obj.foo(4, 2, a: 1)
+    assert_equal [[4, 2, 3], {a: 1}], obj.foo(4, 2, 3, a: 1)
+    assert_equal [[4, 2, 3], {a: 1}], obj.foo(4, 2, 3, a: 1){|args, kws| [args, kws]}
+
+    obj.singleton_class.send(:remove_method, :foo)
+    obj.instance_eval('def foo(_a, ...) bar(1, ...) end', __FILE__, __LINE__)
+    assert_equal [[1], {}], obj.foo(4)
+    assert_equal [[1, 2], {}], obj.foo(4, 2)
+    assert_equal [[1, 2, 3], {}], obj.foo(4, 2, 3)
+    assert_equal [[1], {a: 1}], obj.foo(4, a: 1)
+    assert_equal [[1, 2], {a: 1}], obj.foo(4, 2, a: 1)
+    assert_equal [[1, 2, 3], {a: 1}], obj.foo(4, 2, 3, a: 1)
+    assert_equal [[1, 2, 3], {a: 1}], obj.foo(4, 2, 3, a: 1){|args, kws| [args, kws]}
+
+    obj.singleton_class.send(:remove_method, :foo)
+    obj.instance_eval('def foo(_a, _b, ...) bar(...) end', __FILE__, __LINE__)
+    assert_equal [[], {}], obj.foo(4, 5)
+    assert_equal [[2], {}], obj.foo(4, 5, 2)
+    assert_equal [[2, 3], {}], obj.foo(4, 5, 2, 3)
+    assert_equal [[], {a: 1}], obj.foo(4, 5, a: 1)
+    assert_equal [[2], {a: 1}], obj.foo(4, 5, 2, a: 1)
+    assert_equal [[2, 3], {a: 1}], obj.foo(4, 5, 2, 3, a: 1)
+    assert_equal [[2, 3], {a: 1}], obj.foo(4, 5, 2, 3, a: 1){|args, kws| [args, kws]}
+
+    obj.singleton_class.send(:remove_method, :foo)
+    obj.instance_eval('def foo(_a, _b, ...) bar(1, ...) end', __FILE__, __LINE__)
+    assert_equal [[1], {}], obj.foo(4, 5)
+    assert_equal [[1, 2], {}], obj.foo(4, 5, 2)
+    assert_equal [[1, 2, 3], {}], obj.foo(4, 5, 2, 3)
+    assert_equal [[1], {a: 1}], obj.foo(4, 5, a: 1)
+    assert_equal [[1, 2], {a: 1}], obj.foo(4, 5, 2, a: 1)
+    assert_equal [[1, 2, 3], {a: 1}], obj.foo(4, 5, 2, 3, a: 1)
+    assert_equal [[1, 2, 3], {a: 1}], obj.foo(4, 5, 2, 3, a: 1){|args, kws| [args, kws]}
+
+    obj.singleton_class.send(:remove_method, :foo)
+    obj.instance_eval('def foo(_a, ...) bar(1, 2, ...) end', __FILE__, __LINE__)
+    assert_equal [[1, 2], {}], obj.foo(5)
+    assert_equal [[1, 2, 5], {}], obj.foo(4, 5)
+    assert_equal [[1, 2, 5, 2], {}], obj.foo(4, 5, 2)
+    assert_equal [[1, 2, 5, 2, 3], {}], obj.foo(4, 5, 2, 3)
+    assert_equal [[1, 2, 5], {a: 1}], obj.foo(4, 5, a: 1)
+    assert_equal [[1, 2, 5, 2], {a: 1}], obj.foo(4, 5, 2, a: 1)
+    assert_equal [[1, 2, 5, 2, 3], {a: 1}], obj.foo(4, 5, 2, 3, a: 1)
+    assert_equal [[1, 2, 5, 2, 3], {a: 1}], obj.foo(4, 5, 2, 3, a: 1){|args, kws| [args, kws]}
+
+    obj.singleton_class.send(:remove_method, :foo)
+    obj.instance_eval('def foo(a, b, ...) bar(b, a, ...) end', __FILE__, __LINE__)
+    assert_equal [[5, 4], {}], obj.foo(4, 5)
+    assert_equal [[5, 4, 2], {}], obj.foo(4, 5, 2)
+    assert_equal [[5, 4, 2, 3], {}], obj.foo(4, 5, 2, 3)
+    assert_equal [[5, 4], {a: 1}], obj.foo(4, 5, a: 1)
+    assert_equal [[5, 4, 2], {a: 1}], obj.foo(4, 5, 2, a: 1)
+    assert_equal [[5, 4, 2, 3], {a: 1}], obj.foo(4, 5, 2, 3, a: 1)
+    assert_equal [[5, 4, 2, 3], {a: 1}], obj.foo(4, 5, 2, 3, a: 1){|args, kws| [args, kws]}
+
+    obj.singleton_class.send(:remove_method, :foo)
+    obj.instance_eval('def foo(a, _b, ...) bar(a, ...) end', __FILE__, __LINE__)
+    assert_equal [[4], {}], obj.foo(4, 5)
+    assert_equal [[4, 2], {}], obj.foo(4, 5, 2)
+    assert_equal [[4, 2, 3], {}], obj.foo(4, 5, 2, 3)
+    assert_equal [[4], {a: 1}], obj.foo(4, 5, a: 1)
+    assert_equal [[4, 2], {a: 1}], obj.foo(4, 5, 2, a: 1)
+    assert_equal [[4, 2, 3], {a: 1}], obj.foo(4, 5, 2, 3, a: 1)
+    assert_equal [[4, 2, 3], {a: 1}], obj.foo(4, 5, 2, 3, a: 1){|args, kws| [args, kws]}
+
+    obj.singleton_class.send(:remove_method, :foo)
+    obj.instance_eval('def foo(a, ...) bar(a, 1, ...) end', __FILE__, __LINE__)
+    assert_equal [[4, 1], {}], obj.foo(4)
+    assert_equal [[4, 1, 5], {}], obj.foo(4, 5)
+    assert_equal [[4, 1, 5, 2], {}], obj.foo(4, 5, 2)
+    assert_equal [[4, 1, 5, 2, 3], {}], obj.foo(4, 5, 2, 3)
+    assert_equal [[4, 1, 5], {a: 1}], obj.foo(4, 5, a: 1)
+    assert_equal [[4, 1, 5, 2], {a: 1}], obj.foo(4, 5, 2, a: 1)
+    assert_equal [[4, 1, 5, 2, 3], {a: 1}], obj.foo(4, 5, 2, 3, a: 1)
+    assert_equal [[4, 1, 5, 2, 3], {a: 1}], obj.foo(4, 5, 2, 3, a: 1){|args, kws| [args, kws]}
+  end
+
+  def test_rightward_assign
+    assert_equal(1, eval("1 => a"))
+    assert_equal([2,3], eval("13.divmod(5) => a,b; [a, b]"))
+    assert_equal([2,3,2,3], eval("13.divmod(5) => a,b => c, d; [a, b, c, d]"))
+    assert_equal(3, eval("1+2 => a"))
   end
 
   private

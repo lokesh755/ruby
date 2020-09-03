@@ -561,7 +561,7 @@ BSD_vfprintf(FILE *fp, const char *fmt0, va_list ap)
 	int fprec = 0;		/* floating point precision */
 	char expstr[7];		/* buffer for exponent string */
 #endif
-	u_long MAYBE_UNUSED(ulval); /* integer arguments %[diouxX] */
+	u_long MAYBE_UNUSED(ulval) = 0; /* integer arguments %[diouxX] */
 #ifdef _HAVE_SANE_QUAD_
 	u_quad_t MAYBE_UNUSED(uqval); /* %q integers */
 #endif /* _HAVE_SANE_QUAD_ */
@@ -823,7 +823,7 @@ reswitch:	switch (ch) {
 	(PRI_EXTRA_MARK_LEN < 1 || \
 	 (*(s) == PRI_EXTRA_MARK[0] && \
 	  (PRI_EXTRA_MARK_LEN == 1 || \
-	   strncmp((s)+1, PRI_EXTRA_MARK+1, \
+	   strncmp((s)+1, &PRI_EXTRA_MARK[1], \
 		   PRI_EXTRA_MARK_LEN-1) == 0)))
 #else
 # define PRI_EXTRA_MARK_LEN 0

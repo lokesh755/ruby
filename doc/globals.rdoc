@@ -30,29 +30,26 @@ $LOAD_PATH::   Load path for searching Ruby scripts and extension libraries used
                the path the original Kernel#require method would load.
 $LOADED_FEATURES::   The array contains the module names loaded by require.
                      Aliased to $".
-$DEBUG::     The debug flag, which is set by the -d switch.  Enabling debug
+$DEBUG::     The debug flag, which is set by the <tt>-d</tt> switch.  Enabling debug
              output prints each exception raised to $stderr (but not its
              backtrace).  Setting this to a true value enables debug output as
-             if -d were given on the command line.  Setting this to a false
+             if <tt>-d</tt> were given on the command line.  Setting this to a false
              value disables debug output. Aliased to $-d.
 $FILENAME::  Current input filename from ARGF. Same as ARGF.filename.
 $stderr::    The current standard error output.
 $stdin::     The current standard input.
 $stdout::    The current standard output.
-$VERBOSE::   The verbose flag, which is set by the -w or -v switch.  Setting
-             this to a true value enables warnings as if -w or -v were given
+$VERBOSE::   The verbose flag, which is set by the <tt>-w</tt> or <tt>-v</tt> switch.
+             Setting this to a true value enables warnings as if <tt>-w</tt> or <tt>-v</tt> were given
              on the command line.  Setting this to +nil+ disables warnings,
              including from Kernel#warn. Aliased to $-v and $-w.
-$-a::  True if option -a is set. Read-only variable.
+$-a::  True if option <tt>-a</tt> is set. Read-only variable.
 $-i::  In in-place-edit mode, this variable holds the extension, otherwise +nil+.
-$-l::  True if option -l is set. Read-only variable.
-$-p::  True if option -p is set. Read-only variable.
+$-l::  True if option <tt>-l</tt> is set. Read-only variable.
+$-p::  True if option <tt>-p</tt> is set. Read-only variable.
 
 == Pre-defined global constants
 
-TRUE::              The typical true value. Deprecated.
-FALSE::             The +false+ itself. Deprecated.
-NIL::               The +nil+ itself. Deprecated.
 STDIN::             The standard input. The default value for $stdin.
 STDOUT::            The standard output. The default value for $stdout.
 STDERR::            The standard error output. The default value for $stderr.
@@ -64,9 +61,9 @@ TOPLEVEL_BINDING::  The Binding of the top level scope.
 RUBY_VERSION::      The Ruby language version.
 RUBY_RELEASE_DATE:: The release date string.
 RUBY_PLATFORM::     The platform identifier.
-RUBY_PATCHLEVEL::   The patchlevel for this ruby.  If this is a development build of ruby the patchlevel will be -1.
-RUBY_REVISION::     The GIT commit hash for this ruby.
-RUBY_COPYRIGHT::    The copyright string for ruby.
+RUBY_PATCHLEVEL::   The patchlevel for this Ruby.  If this is a development build of Ruby the patchlevel will be -1.
+RUBY_REVISION::     The GIT commit hash for this Ruby.
+RUBY_COPYRIGHT::    The copyright string for Ruby.
 RUBY_ENGINE::       The name of the Ruby implementation.
 RUBY_ENGINE_VERSION:: The version of the Ruby implementation.
 RUBY_DESCRIPTION::  The same as <tt>ruby --version</tt>, a String describing various aspects of the Ruby implementation.

@@ -13,7 +13,7 @@
 #pragma clang diagnostic ignored "-Wgcc-compat"
 #endif
 
-#include "ruby/config.h"
+#include "ruby/internal/config.h"
 #include "ruby/defines.h"
 #include "ruby/missing.h"
 #include "addr2line.h"
@@ -21,11 +21,11 @@
 #include <stdio.h>
 #include <errno.h>
 
-#ifdef HAVE_STDBOOL_H
-#include <stdbool.h>
-#else
-#include "missing/stdbool.h"
+#ifdef HAVE_LIBPROC_H
+#include <libproc.h>
 #endif
+
+#include "ruby/internal/stdbool.h"
 
 #if defined(USE_ELF) || defined(HAVE_MACH_O_LOADER_H)
 
@@ -2066,6 +2066,15 @@ main_exe_path(void)
 	return -1;
     }
     len--; /* sysctl sets strlen+1 */
+    return len;
+}
+#elif defined(HAVE_LIBPROC_H)
+static ssize_t
+main_exe_path(void)
+{
+    int len = proc_pidpath(getpid(), binary_filename, PATH_MAX);
+    if (len == 0) return 0;
+    binary_filename[len] = 0;
     return len;
 }
 #else

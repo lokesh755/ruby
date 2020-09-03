@@ -64,7 +64,18 @@ module Test
         args = @init_hook.call(args, options) if @init_hook
         non_options(args, options)
         @run_options = orig_args
-        @help = orig_args.map { |s| s =~ /[\s|&<>$()]/ ? s.inspect : s }.join " "
+
+        if seed = options[:seed]
+          srand(seed)
+        else
+          seed = options[:seed] = srand % 100_000
+          srand(seed)
+          orig_args.unshift "--seed=#{seed}"
+        end
+
+        @help = "\n" + orig_args.map { |s|
+          "  " + (s =~ /[\s|&<>$()]/ ? s.inspect : s)
+        }.join("\n")
         @options = options
       end
 
@@ -79,7 +90,7 @@ module Test
         end
 
         opts.on '-s', '--seed SEED', Integer, "Sets random seed" do |m|
-          options[:seed] = m
+          options[:seed] = m.to_i
         end
 
         opts.on '-v', '--verbose', "Verbose. Show progress processing files." do
@@ -91,7 +102,7 @@ module Test
           (options[:filter] ||= []) << a
         end
 
-        opts.on '--test-order=random|alpha|sorted', [:random, :alpha, :sorted] do |a|
+        opts.on '--test-order=random|alpha|sorted|nosort', [:random, :alpha, :sorted, :nosort] do |a|
           MiniTest::Unit::TestCase.test_order = a
         end
       end
@@ -463,6 +474,14 @@ module Test
         # Require needed thing for parallel running
         require 'timeout'
         @tasks = @files.dup # Array of filenames.
+
+        case MiniTest::Unit::TestCase.test_order
+        when :random
+          @tasks.shuffle!
+        else
+          # sorted
+        end
+
         @need_quit = false
         @dead_workers = []  # Array of dead workers.
         @warnings = []
@@ -508,7 +527,7 @@ module Test
             parallel = @options[:parallel]
             @options[:parallel] = false
             suites, rep = rep.partition {|r| r[:testcase] && r[:file] && r[:report].any? {|e| !e[2].is_a?(MiniTest::Skip)}}
-            suites.map {|r| r[:file]}.uniq.each {|file| require file}
+            suites.map {|r| File.realpath(r[:file])}.uniq.each {|file| require file}
             suites.map! {|r| eval("::"+r[:testcase])}
             del_status_line or puts
             unless suites.empty?
@@ -865,6 +884,18 @@ module Test
         end
       end
 
+      def complement_test_name f, orig_f
+        basename = File.basename(f)
+
+        if /\.rb\z/ !~ basename
+          return File.join(File.dirname(f), basename+'.rb')
+        elsif /\Atest_/ !~ basename
+          return File.join(File.dirname(f), 'test_'+basename)
+        end if f.end_with?(basename) # otherwise basename is dirname/
+
+        raise ArgumentError, "file not found: #{orig_f}"
+      end
+
       def non_options(files, options)
         paths = [options.delete(:base_directory), nil].uniq
         if reject = options.delete(:reject)
@@ -872,6 +903,7 @@ module Test
         end
         files.map! {|f|
           f = f.tr(File::ALT_SEPARATOR, File::SEPARATOR) if File::ALT_SEPARATOR
+          orig_f = f
           while true
             ret = ((paths if /\A\.\.?(?:\z|\/)/ !~ f) || [nil]).any? do |prefix|
               if prefix
@@ -898,11 +930,7 @@ module Test
               end
             end
             if !ret
-              if /\.rb\z/ =~ f
-                raise ArgumentError, "file not found: #{f}"
-              else
-                f = "#{f}.rb"
-              end
+              f = complement_test_name(f, orig_f)
             else
               break ret
             end
@@ -913,12 +941,15 @@ module Test
       end
     end
 
-    module GCStressOption # :nodoc: all
+    module GCOption # :nodoc: all
       def setup_options(parser, options)
         super
         parser.separator "GC options:"
         parser.on '--[no-]gc-stress', 'Set GC.stress as true' do |flag|
           options[:gc_stress] = flag
+        end
+        parser.on '--[no-]gc-compact', 'GC.compact every time' do |flag|
+          options[:gc_compact] = flag
         end
       end
 
@@ -929,9 +960,21 @@ module Test
             define_method(:run) do |runner|
               begin
                 gc_stress, GC.stress = GC.stress, true
-                oldrun.bind(self).call(runner)
+                oldrun.bind_call(self, runner)
               ensure
                 GC.stress = gc_stress
+              end
+            end
+          end
+        end
+        if options.delete(:gc_compact)
+          MiniTest::Unit::TestCase.class_eval do
+            oldrun = instance_method(:run)
+            define_method(:run) do |runner|
+              begin
+                oldrun.bind_call(self, runner)
+              ensure
+                GC.compact
               end
             end
           end
@@ -1071,7 +1114,7 @@ module Test
       include Test::Unit::GlobOption
       include Test::Unit::RepeatOption
       include Test::Unit::LoadPathOption
-      include Test::Unit::GCStressOption
+      include Test::Unit::GCOption
       include Test::Unit::ExcludesOption
       include Test::Unit::TimeoutOption
       include Test::Unit::RunCount

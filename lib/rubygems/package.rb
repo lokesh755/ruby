@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # frozen_string_literal: true
 #--
 # Copyright (C) 2004 Mauricio Julio Fernández Pradier
@@ -8,7 +7,8 @@
 # Example using a Gem::Package
 #
 # Builds a .gem file given a Gem::Specification. A .gem file is a tarball
-# which contains a data.tar.gz and metadata.gz, and possibly signatures.
+# which contains a data.tar.gz, metadata.gz, checksums.yaml.gz and possibly
+# signatures.
 #
 #   require 'rubygems'
 #   require 'rubygems/package'
@@ -41,19 +41,17 @@
 # #files are the files in the .gem tar file, not the Ruby files in the gem
 # #extract_files and #contents automatically call #verify
 
+require "rubygems"
 require 'rubygems/security'
-require 'rubygems/specification'
 require 'rubygems/user_interaction'
 require 'zlib'
 
 class Gem::Package
-
   include Gem::UserInteraction
 
   class Error < Gem::Exception; end
 
   class FormatError < Error
-
     attr_reader :path
 
     def initialize(message, source = nil)
@@ -65,16 +63,13 @@ class Gem::Package
 
       super message
     end
-
   end
 
   class PathError < Error
-
     def initialize(destination, destination_dir)
       super "installing into parent path %s of %s is not allowed" %
               [destination, destination_dir]
     end
-
   end
 
   class NonSeekableIO < Error; end
@@ -98,6 +93,11 @@ class Gem::Package
   # files in the top-level container.
 
   attr_reader :files
+
+  ##
+  # Reference to the gem being packaged.
+
+  attr_reader :gem
 
   ##
   # The security policy used for verifying the contents of this package.
@@ -188,10 +188,10 @@ class Gem::Package
   def initialize(gem, security_policy) # :notnew:
     @gem = gem
 
-    @build_time      = ENV["SOURCE_DATE_EPOCH"] ? Time.at(ENV["SOURCE_DATE_EPOCH"].to_i).utc : Time.now
+    @build_time      = Gem.source_date_epoch
     @checksums       = {}
     @contents        = nil
-    @digests         = Hash.new { |h, algorithm| h[algorithm] = {} }
+    @digests         = Hash.new {|h, algorithm| h[algorithm] = {} }
     @files           = nil
     @security_policy = security_policy
     @signatures      = {}
@@ -212,7 +212,7 @@ class Gem::Package
   def add_checksums(tar)
     Gem.load_yaml
 
-    checksums_by_algorithm = Hash.new { |h, algorithm| h[algorithm] = {} }
+    checksums_by_algorithm = Hash.new {|h, algorithm| h[algorithm] = {} }
 
     @checksums.each do |name, digests|
       digests.each do |algorithm, digest|
@@ -358,12 +358,7 @@ EOM
                  end
 
     algorithms.each do |algorithm|
-      digester =
-        if defined?(OpenSSL::Digest)
-          OpenSSL::Digest.new algorithm
-        else
-          Digest.const_get(algorithm).new
-        end
+      digester = Gem::Security.create_digest(algorithm)
 
       digester << entry.read(16384) until entry.eof?
 
@@ -493,7 +488,7 @@ EOM
         real_destination.start_with? destination_dir + '/'
     end
 
-    destination.untaint
+    destination.tap(&Gem::UNTAINT)
     destination
   end
 
@@ -513,7 +508,7 @@ EOM
       path = File.expand_path(path + File::SEPARATOR + basename)
       lstat = File.lstat path rescue nil
       if !lstat || !lstat.directory?
-        unless normalize_path(path).start_with? normalize_path(destination_dir) and (FileUtils.mkdir path, mkdir_options rescue false)
+        unless normalize_path(path).start_with? normalize_path(destination_dir) and (FileUtils.mkdir path, **mkdir_options rescue false)
           raise Gem::Package::PathError.new(file_name, destination_dir)
         end
       end
@@ -529,11 +524,7 @@ EOM
     when 'metadata' then
       @spec = Gem::Specification.from_yaml entry.read
     when 'metadata.gz' then
-      args = [entry]
-      args << { :external_encoding => Encoding::UTF_8 } if
-        Zlib::GzipReader.method(:wrap).arity != 1
-
-      Zlib::GzipReader.wrap(*args) do |gzio|
+      Zlib::GzipReader.wrap(entry, external_encoding: Encoding::UTF_8) do |gzio|
         @spec = Gem::Specification.from_yaml gzio.read
       end
     end
@@ -579,10 +570,10 @@ EOM
         )
 
       @spec.signing_key = nil
-      @spec.cert_chain = @signer.cert_chain.map { |cert| cert.to_s }
+      @spec.cert_chain = @signer.cert_chain.map {|cert| cert.to_s }
     else
       @signer = Gem::Security::Signer.new nil, nil, passphrase
-      @spec.cert_chain = @signer.cert_chain.map { |cert| cert.to_pem } if
+      @spec.cert_chain = @signer.cert_chain.map {|cert| cert.to_pem } if
         @signer.cert_chain
     end
   end
@@ -678,10 +669,9 @@ EOM
     when 'data.tar.gz' then
       verify_gz entry
     end
-  rescue => e
-    message = "package is corrupt, exception while verifying: " +
-              "#{e.message} (#{e.class})"
-    raise Gem::Package::FormatError.new message, @gem
+  rescue
+    warn "Exception while verifying #{@gem.path}"
+    raise
   end
 
   ##
@@ -716,7 +706,6 @@ EOM
   rescue Zlib::GzipFile::Error => e
     raise Gem::Package::FormatError.new(e.message, entry.full_name)
   end
-
 end
 
 require 'rubygems/package/digest_io'

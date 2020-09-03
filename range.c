@@ -9,19 +9,31 @@
 
 **********************************************************************/
 
-#include "internal.h"
-#include "id.h"
+#include "ruby/internal/config.h"
+
 #include <assert.h>
+#include <math.h>
 
 #ifdef HAVE_FLOAT_H
 #include <float.h>
 #endif
-#include <math.h>
+
+#include "id.h"
+#include "internal.h"
+#include "internal/array.h"
+#include "internal/compar.h"
+#include "internal/enum.h"
+#include "internal/enumerator.h"
+#include "internal/error.h"
+#include "internal/numeric.h"
+#include "internal/range.h"
 
 VALUE rb_cRange;
 static ID id_beg, id_end, id_excl;
 #define id_cmp idCmp
 #define id_succ idSucc
+#define id_min idMin
+#define id_max idMax
 
 static VALUE r_cover_p(VALUE, VALUE, VALUE, VALUE);
 
@@ -308,6 +320,8 @@ linear_object_p(VALUE obj)
       case T_FLOAT:
       case T_BIGNUM:
 	return TRUE;
+      default:
+        break;
     }
     if (rb_obj_is_kind_of(obj, rb_cNumeric)) return TRUE;
     if (rb_obj_is_kind_of(obj, rb_cTime)) return TRUE;
@@ -817,6 +831,38 @@ range_enum_size(VALUE range, VALUE args, VALUE eobj)
     return range_size(range);
 }
 
+RBIMPL_ATTR_NORETURN()
+static void
+range_each_bignum_endless(VALUE beg)
+{
+    for (;; beg = rb_big_plus(beg, INT2FIX(1))) {
+        rb_yield(beg);
+    }
+    UNREACHABLE;
+}
+
+RBIMPL_ATTR_NORETURN()
+static void
+range_each_fixnum_endless(VALUE beg)
+{
+    for (long i = FIX2LONG(beg); FIXABLE(i); i++) {
+        rb_yield(LONG2FIX(i));
+    }
+
+    range_each_bignum_endless(LONG2NUM(RUBY_FIXNUM_MAX + 1));
+    UNREACHABLE;
+}
+
+static VALUE
+range_each_fixnum_loop(VALUE beg, VALUE end, VALUE range)
+{
+    long lim = FIX2LONG(end) + !EXCL(range);
+    for (long i = FIX2LONG(beg); i < lim; i++) {
+        rb_yield(LONG2FIX(i));
+    }
+    return range;
+}
+
 /*
  *  call-seq:
  *     rng.each {| i | block } -> rng
@@ -842,7 +888,7 @@ static VALUE
 range_each(VALUE range)
 {
     VALUE beg, end;
-    long i, lim;
+    long i;
 
     RETURN_SIZED_ENUMERATOR(range, 0, 0, range_enum_size);
 
@@ -850,24 +896,10 @@ range_each(VALUE range)
     end = RANGE_END(range);
 
     if (FIXNUM_P(beg) && NIL_P(end)) {
-      fixnum_endless:
-	i = FIX2LONG(beg);
-	while (FIXABLE(i)) {
-	    rb_yield(LONG2FIX(i++));
-	}
-	beg = LONG2NUM(i);
-      bignum_endless:
-	for (;; beg = rb_big_plus(beg, INT2FIX(1)))
-	    rb_yield(beg);
+        range_each_fixnum_endless(beg);
     }
     else if (FIXNUM_P(beg) && FIXNUM_P(end)) { /* fixnums are special */
-      fixnum_loop:
-	lim = FIX2LONG(end);
-	if (!EXCL(range))
-	    lim += 1;
-	for (i = FIX2LONG(beg); i < lim; i++) {
-	    rb_yield(LONG2FIX(i));
-	}
+        return range_each_fixnum_loop(beg, end, range);
     }
     else if (RB_INTEGER_TYPE_P(beg) && (NIL_P(end) || RB_INTEGER_TYPE_P(end))) {
 	if (SPECIAL_CONST_P(end) || RBIGNUM_POSITIVE_P(end)) { /* end >= FIXNUM_MIN */
@@ -876,11 +908,11 @@ range_each(VALUE range)
 		    do {
 			rb_yield(beg);
 		    } while (!FIXNUM_P(beg = rb_big_plus(beg, INT2FIX(1))));
-		    if (NIL_P(end)) goto fixnum_endless;
-		    if (FIXNUM_P(end)) goto fixnum_loop;
+                    if (NIL_P(end)) range_each_fixnum_endless(beg);
+                    if (FIXNUM_P(end)) return range_each_fixnum_loop(beg, end, range);
 		}
 		else {
-		    if (NIL_P(end)) goto bignum_endless;
+                    if (NIL_P(end)) range_each_bignum_endless(beg);
 		    if (FIXNUM_P(end)) return range;
 		}
 	    }
@@ -991,7 +1023,7 @@ first_i(RB_BLOCK_CALL_FUNC_ARGLIST(i, cbarg))
     }
     rb_ary_push(ary[1], i);
     n--;
-    ary[0] = INT2NUM(n);
+    ary[0] = LONG2NUM(n);
     return Qnil;
 }
 
@@ -1136,6 +1168,10 @@ range_last(int argc, VALUE *argv, VALUE range)
 static VALUE
 range_min(int argc, VALUE *argv, VALUE range)
 {
+    if (NIL_P(RANGE_BEG(range))) {
+	rb_raise(rb_eRangeError, "cannot get the minimum of beginless range");
+    }
+
     if (rb_block_given_p()) {
         if (NIL_P(RANGE_END(range))) {
             rb_raise(rb_eRangeError, "cannot get the minimum of endless range with custom comparison method");
@@ -1164,14 +1200,34 @@ range_min(int argc, VALUE *argv, VALUE range)
  *     rng.max(n)                    -> obj
  *     rng.max(n) {| a,b | block }   -> obj
  *
- *  Returns the maximum value in the range. Returns +nil+ if the begin
- *  value of the range larger than the end value. Returns +nil+ if
- *  the begin value of an exclusive range is equal to the end value.
+ *  Returns the maximum value in the range, or an array of maximum
+ *  values in the range if given an \Integer argument.
  *
- *  Can be given an optional block to override the default comparison
- *  method <code>a <=> b</code>.
+ *  For inclusive ranges with an end, the maximum value of the range
+ *  is the same as the end of the range.
  *
- *    (10..20).max    #=> 20
+ *  If an argument or block is given, or +self+ is an exclusive,
+ *  non-numeric range, calls Enumerable#max (via +super+) with the
+ *  argument and/or block to get the maximum values, unless +self+ is
+ *  a beginless range, in which case it raises a RangeError.
+ *
+ *  If +self+ is an exclusive, integer range (both start and end of the
+ *  range are integers), and no arguments or block are provided, returns
+ *  last value in the range (1 before the end).  Otherwise, if +self+ is
+ *  an exclusive, numeric range, raises a TypeError.
+ *
+ *  Returns +nil+ if the begin value of the range larger than the
+ *  end value. Returns +nil+ if the begin value of an exclusive
+ *  range is equal to the end value.  Raises a RangeError if called on
+ *  an endless range.
+ *
+ *  Examples:
+ *    (10..20).max                        #=> 20
+ *    (10..20).max(2)                     #=> [20, 19]
+ *    (10...20).max                       #=> 19
+ *    (10...20).max(2)                    #=> [19, 18]
+ *    (10...20).max{|x, y| -x <=> -y }    #=> 10
+ *    (10...20).max(2){|x, y| -x <=> -y } #=> [10, 11]
  */
 
 static VALUE
@@ -1184,13 +1240,17 @@ range_max(int argc, VALUE *argv, VALUE range)
 	rb_raise(rb_eRangeError, "cannot get the maximum of endless range");
     }
 
+    VALUE b = RANGE_BEG(range);
+
     if (rb_block_given_p() || (EXCL(range) && !nm) || argc) {
+        if (NIL_P(b)) {
+            rb_raise(rb_eRangeError, "cannot get the maximum of beginless range with custom comparison method");
+        }
         return rb_call_super(argc, argv);
     }
     else {
         struct cmp_opt_data cmp_opt = { 0, 0 };
-        VALUE b = RANGE_BEG(range);
-        int c = OPTIMIZED_CMP(b, e, cmp_opt);
+        int c = NIL_P(b) ? -1 : OPTIMIZED_CMP(b, e, cmp_opt);
 
         if (c > 0)
             return Qnil;
@@ -1209,6 +1269,30 @@ range_max(int argc, VALUE *argv, VALUE range)
         }
         return e;
     }
+}
+
+/*
+ *  call-seq:
+ *     rng.minmax                       -> [obj, obj]
+ *     rng.minmax {| a,b | block }      -> [obj, obj]
+ *
+ *  Returns a two element array which contains the minimum and the
+ *  maximum value in the range.
+ *
+ *  Can be given an optional block to override the default comparison
+ *  method <code>a <=> b</code>.
+ */
+
+static VALUE
+range_minmax(VALUE range)
+{
+    if (rb_block_given_p()) {
+        return rb_call_super(0, NULL);
+    }
+    return rb_assoc_new(
+        rb_funcall(range, id_min, 0),
+        rb_funcall(range, id_max, 0)
+    );
 }
 
 int
@@ -1304,7 +1388,6 @@ range_to_s(VALUE range)
     str = rb_str_dup(str);
     rb_str_cat(str, "...", EXCL(range) ? 3 : 2);
     rb_str_append(str, str2);
-    OBJ_INFECT(str, range);
 
     return str;
 }
@@ -1328,7 +1411,6 @@ inspect_range(VALUE range, VALUE dummy, int recur)
         str2 = rb_inspect(RANGE_END(range));
     }
     if (str2 != Qundef) rb_str_append(str, str2);
-    OBJ_INFECT(str, range);
 
     return str;
 }
@@ -1348,31 +1430,38 @@ range_inspect(VALUE range)
     return rb_exec_recursive(inspect_range, range, 0);
 }
 
-static VALUE range_include_internal(VALUE range, VALUE val);
+static VALUE range_include_internal(VALUE range, VALUE val, int string_use_cover);
 
 /*
  *  call-seq:
  *     rng === obj       ->  true or false
  *
- *  Returns <code>true</code> if +obj+ is an element of the range,
- *  <code>false</code> otherwise.  Conveniently, <code>===</code> is the
- *  comparison operator used by <code>case</code> statements.
+ *  Returns <code>true</code> if +obj+ is between begin and end of range,
+ *  <code>false</code> otherwise (same as #cover?). Conveniently,
+ *  <code>===</code> is the comparison operator used by <code>case</code>
+ *  statements.
  *
  *     case 79
- *     when 1..50   then   print "low\n"
- *     when 51..75  then   print "medium\n"
- *     when 76..100 then   print "high\n"
+ *     when 1..50   then   puts "low"
+ *     when 51..75  then   puts "medium"
+ *     when 76..100 then   puts "high"
  *     end
+ *     # Prints "high"
  *
- *  <em>produces:</em>
+ *     case "2.6.5"
+ *     when ..."2.4" then puts "EOL"
+ *     when "2.4"..."2.5" then puts "maintenance"
+ *     when "2.5"..."2.7" then puts "stable"
+ *     when "2.7".. then puts "upcoming"
+ *     end
+ *     # Prints "stable"
  *
- *     high
  */
 
 static VALUE
 range_eqq(VALUE range, VALUE val)
 {
-    VALUE ret = range_include_internal(range, val);
+    VALUE ret = range_include_internal(range, val, 1);
     if (ret != Qundef) return ret;
     return r_cover_p(range, RANGE_BEG(range), RANGE_END(range), val);
 }
@@ -1384,24 +1473,31 @@ range_eqq(VALUE range, VALUE val)
  *     rng.include?(obj) ->  true or false
  *
  *  Returns <code>true</code> if +obj+ is an element of
- *  the range, <code>false</code> otherwise.  If begin and end are
- *  numeric, comparison is done according to the magnitude of the values.
+ *  the range, <code>false</code> otherwise.
  *
  *     ("a".."z").include?("g")   #=> true
  *     ("a".."z").include?("A")   #=> false
  *     ("a".."z").include?("cc")  #=> false
+ *
+ *  If you need to ensure +obj+ is between +begin+ and +end+, use #cover?
+ *
+ *     ("a".."z").cover?("cc")  #=> true
+ *
+ *  If begin and end are numeric, #include? behaves like #cover?
+ *
+ *     (1..3).include?(1.5) # => true
  */
 
 static VALUE
 range_include(VALUE range, VALUE val)
 {
-    VALUE ret = range_include_internal(range, val);
+    VALUE ret = range_include_internal(range, val, 0);
     if (ret != Qundef) return ret;
     return rb_call_super(1, &val);
 }
 
 static VALUE
-range_include_internal(VALUE range, VALUE val)
+range_include_internal(VALUE range, VALUE val, int string_use_cover)
 {
     VALUE beg = RANGE_BEG(range);
     VALUE end = RANGE_END(range);
@@ -1413,11 +1509,16 @@ range_include_internal(VALUE range, VALUE val)
 	!NIL_P(rb_check_to_integer(end, "to_int"))) {
 	return r_cover_p(range, beg, end, val);
     }
-    else if (RB_TYPE_P(beg, T_STRING)) {
-	if (RB_TYPE_P(end, T_STRING)) {
-	    VALUE rb_str_include_range_p(VALUE beg, VALUE end, VALUE val, VALUE exclusive);
-	    return rb_str_include_range_p(beg, end, val, RANGE_EXCL(range));
-	}
+    else if (RB_TYPE_P(beg, T_STRING) || RB_TYPE_P(end, T_STRING)) {
+        if (RB_TYPE_P(beg, T_STRING) && RB_TYPE_P(end, T_STRING)) {
+            if (string_use_cover) {
+                return r_cover_p(range, beg, end, val);
+            }
+            else {
+                VALUE rb_str_include_range_p(VALUE beg, VALUE end, VALUE val, VALUE exclusive);
+                return rb_str_include_range_p(beg, end, val, RANGE_EXCL(range));
+            }
+        }
         else if (NIL_P(beg)) {
 	    VALUE r = rb_funcall(val, id_cmp, 1, end);
 	    if (NIL_P(r)) return Qfalse;
@@ -1499,7 +1600,7 @@ r_cover_range_p(VALUE range, VALUE beg, VALUE end, VALUE val)
 
     if (!NIL_P(end) && NIL_P(val_end)) return FALSE;
     if (!NIL_P(beg) && NIL_P(val_beg)) return FALSE;
-    if (!NIL_P(val_beg) && !NIL_P(val_end) && r_less(val_beg, val_end) > -EXCL(val)) return FALSE;
+    if (!NIL_P(val_beg) && !NIL_P(val_end) && r_less(val_beg, val_end) > (EXCL(val) ? -1 : 0)) return FALSE;
     if (!NIL_P(val_beg) && !r_cover_p(range, beg, end, val_beg)) return FALSE;
 
     cmp_end = r_less(end, val_end);
@@ -1514,7 +1615,7 @@ r_cover_range_p(VALUE range, VALUE beg, VALUE end, VALUE val)
         return TRUE;
     }
 
-    val_max = rb_rescue2(r_call_max, val, NULL, Qnil, rb_eTypeError, (VALUE)0);
+    val_max = rb_rescue2(r_call_max, val, 0, Qnil, rb_eTypeError, (VALUE)0);
     if (val_max == Qnil) return FALSE;
 
     return r_less(end, val_max) >= 0;
@@ -1570,6 +1671,42 @@ range_alloc(VALUE klass)
     /* rb_struct_alloc_noinit itself should not be used because
      * rb_marshal_define_compat uses equality of allocation function */
     return rb_struct_alloc_noinit(klass);
+}
+
+/*
+ *  call-seq:
+ *     range.count                 -> int
+ *     range.count(item)           -> int
+ *     range.count { |obj| block } -> int
+ *
+ *  Identical to Enumerable#count, except it returns Infinity for endless
+ *  ranges.
+ *
+ */
+static VALUE
+range_count(int argc, VALUE *argv, VALUE range)
+{
+    if (argc != 0) {
+        /* It is odd for instance (1...).count(0) to return Infinity. Just let
+         * it loop. */
+        return rb_call_super(argc, argv);
+    }
+    else if (rb_block_given_p()) {
+        /* Likewise it is odd for instance (1...).count {|x| x == 0 } to return
+         * Infinity. Just let it loop. */
+        return rb_call_super(argc, argv);
+    }
+    else if (NIL_P(RANGE_END(range))) {
+        /* We are confident that the answer is Infinity. */
+        return DBL2NUM(HUGE_VAL);
+    }
+    else if (NIL_P(RANGE_BEG(range))) {
+        /* We are confident that the answer is Infinity. */
+        return DBL2NUM(HUGE_VAL);
+    }
+    else {
+        return rb_call_super(argc, argv);
+    }
 }
 
 /*  A Range represents an interval---a set of values with a
@@ -1697,6 +1834,7 @@ Init_Range(void)
     rb_define_method(rb_cRange, "last", range_last, -1);
     rb_define_method(rb_cRange, "min", range_min, -1);
     rb_define_method(rb_cRange, "max", range_max, -1);
+    rb_define_method(rb_cRange, "minmax", range_minmax, 0);
     rb_define_method(rb_cRange, "size", range_size, 0);
     rb_define_method(rb_cRange, "to_a", range_to_a, 0);
     rb_define_method(rb_cRange, "entries", range_to_a, 0);
@@ -1708,4 +1846,5 @@ Init_Range(void)
     rb_define_method(rb_cRange, "member?", range_include, 1);
     rb_define_method(rb_cRange, "include?", range_include, 1);
     rb_define_method(rb_cRange, "cover?", range_cover, 1);
+    rb_define_method(rb_cRange, "count", range_count, -1);
 }

@@ -5,16 +5,27 @@
   which is written in ruby.
 */
 
-#include "ruby/config.h"
+#include "ruby/internal/config.h"
+
 #if defined _MSC_VER
 /* Microsoft Visual C does not define M_PI and others by default */
 # define _USE_MATH_DEFINES 1
 #endif
-#include <math.h>
-#include "internal.h"
-#include "id.h"
 
+#include <ctype.h>
+#include <math.h>
+
+#undef NDEBUG
 #define NDEBUG
+#include "id.h"
+#include "internal.h"
+#include "internal/array.h"
+#include "internal/class.h"
+#include "internal/complex.h"
+#include "internal/math.h"
+#include "internal/numeric.h"
+#include "internal/object.h"
+#include "internal/rational.h"
 #include "ruby_assert.h"
 
 #define ZERO INT2FIX(0)
@@ -235,7 +246,25 @@ f_negate(VALUE x)
     return rb_funcall(x, id_negate, 0);
 }
 
-fun1(real_p)
+static bool nucomp_real_p(VALUE self);
+
+static inline bool
+f_real_p(VALUE x)
+{
+    if (RB_INTEGER_TYPE_P(x)) {
+        return true;
+    }
+    else if (RB_FLOAT_TYPE_P(x)) {
+        return true;
+    }
+    else if (RB_TYPE_P(x, T_RATIONAL)) {
+        return true;
+    }
+    else if (RB_TYPE_P(x, T_COMPLEX)) {
+        return nucomp_real_p(x);
+    }
+    return rb_funcall(x, id_real_p, 0);
+}
 
 inline static VALUE
 f_to_i(VALUE x)
@@ -244,6 +273,7 @@ f_to_i(VALUE x)
 	return rb_str_to_inum(x, 10, 0);
     return rb_funcall(x, id_to_i, 0);
 }
+
 inline static VALUE
 f_to_f(VALUE x)
 {
@@ -266,7 +296,19 @@ f_eqeq_p(VALUE x, VALUE y)
 
 fun2(expt)
 fun2(fdiv)
-fun2(quo)
+
+static VALUE
+f_quo(VALUE x, VALUE y)
+{
+    if (RB_INTEGER_TYPE_P(x))
+        return rb_numeric_quo(x, y);
+    if (RB_FLOAT_TYPE_P(x))
+        return rb_float_div(x, y);
+    if (RB_TYPE_P(x, T_RATIONAL))
+        return rb_numeric_quo(x, y);
+
+    return rb_funcallv(x, id_quo, 1, &y);
+}
 
 inline static int
 f_negative_p(VALUE x)
@@ -361,7 +403,7 @@ nucomp_s_new_internal(VALUE klass, VALUE real, VALUE imag)
 
     RCOMPLEX_SET_REAL(obj, real);
     RCOMPLEX_SET_IMAG(obj, imag);
-    OBJ_FREEZE_RAW(obj);
+    OBJ_FREEZE_RAW((VALUE)obj);
 
     return (VALUE)obj;
 }
@@ -532,6 +574,9 @@ nucomp_f_complex(int argc, VALUE *argv, VALUE klass)
     if (!NIL_P(opts)) {
         raise = rb_opts_exception_p(opts, raise);
     }
+    if (argc > 0 && CLASS_OF(a1) == rb_cComplex && a2 == Qundef) {
+        return a1;
+    }
     return nucomp_convert(rb_cComplex, a1, a2, raise);
 }
 
@@ -617,8 +662,9 @@ f_complex_polar(VALUE klass, VALUE x, VALUE y)
 	    y = DBL2NUM(imag);
 	}
 	else {
-	    y = f_mul(x, DBL2NUM(sin(arg)));
-	    x = f_mul(x, DBL2NUM(cos(arg)));
+            const double ax = sin(arg), ay = cos(arg);
+            y = f_mul(x, DBL2NUM(ax));
+            x = f_mul(x, DBL2NUM(ay));
 	    if (canonicalization && f_zero_p(y)) return x;
 	}
 	return nucomp_s_new_internal(klass, x, y);
@@ -628,6 +674,16 @@ f_complex_polar(VALUE klass, VALUE x, VALUE y)
 					  f_mul(x, m_sin(y)));
 }
 
+#ifdef HAVE___COSPI
+# define cospi(x) __cospi(x)
+#else
+# define cospi(x) cos((x) * M_PI)
+#endif
+#ifdef HAVE___SINPI
+# define sinpi(x) __sinpi(x)
+#else
+# define sinpi(x) sin((x) * M_PI)
+#endif
 /* returns a Complex or Float of ang*PI-rotated abs */
 VALUE
 rb_dbl_complex_new_polar_pi(double abs, double ang)
@@ -645,8 +701,8 @@ rb_dbl_complex_new_polar_pi(double abs, double ang)
 	return DBL2NUM(abs);
     }
     else {
-	ang *= M_PI;
-	return rb_complex_new(DBL2NUM(abs * cos(ang)), DBL2NUM(abs * sin(ang)));
+        const double real = abs * cospi(ang), imag = abs * sinpi(ang);
+        return rb_complex_new(DBL2NUM(real), DBL2NUM(imag));
     }
 }
 
@@ -1062,11 +1118,11 @@ nucomp_eqeq_p(VALUE self, VALUE other)
     return f_boolcast(f_eqeq_p(other, self));
 }
 
-static VALUE
+static bool
 nucomp_real_p(VALUE self)
 {
     get_dat1(self);
-    return(f_zero_p(dat->imag) ? Qtrue : Qfalse);
+    return(f_zero_p(dat->imag) ? true : false);
 }
 
 /*
@@ -1090,7 +1146,8 @@ nucomp_cmp(VALUE self, VALUE other)
         if (RB_TYPE_P(other, T_COMPLEX) && nucomp_real_p(other)) {
             get_dat2(self, other);
             return rb_funcall(adat->real, idCmp, 1, bdat->real);
-        } else if (f_real_p(other)) {
+        }
+        else if (f_real_p(other)) {
             get_dat1(self);
             return rb_funcall(dat->real, idCmp, 1, other);
         }
@@ -1664,8 +1721,6 @@ numeric_to_c(VALUE self)
 {
     return rb_complex_new1(self);
 }
-
-#include <ctype.h>
 
 inline static int
 issign(int c)
@@ -2302,7 +2357,7 @@ Init_Complex(void)
 
     rb_define_global_function("Complex", nucomp_f_complex, -1);
 
-    rb_undef_methods_from(rb_cComplex, rb_mComparable);
+    rb_undef_methods_from(rb_cComplex, RCLASS_ORIGIN(rb_mComparable));
     rb_undef_method(rb_cComplex, "%");
     rb_undef_method(rb_cComplex, "div");
     rb_undef_method(rb_cComplex, "divmod");

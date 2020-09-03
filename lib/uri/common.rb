@@ -3,7 +3,6 @@
 # = uri/common.rb
 #
 # Author:: Akira Yamada <akira@ruby-lang.org>
-# Revision:: $Id$
 # License::
 #   You can redistribute it and/or modify it under the same term as Ruby.
 #
@@ -99,7 +98,7 @@ module URI
     #   # => "@%3F@%21"
     #
     def escape(*arg)
-      warn "URI.escape is obsolete", uplevel: 1 if $VERBOSE
+      warn "URI.#{__callee__} is obsolete", uplevel: 1
       DEFAULT_PARSER.escape(*arg)
     end
     alias encode escape
@@ -130,7 +129,7 @@ module URI
     #   # => "http://example.com/?a=\t\r"
     #
     def unescape(*arg)
-      warn "URI.unescape is obsolete", uplevel: 1 if $VERBOSE
+      warn "URI.#{__callee__} is obsolete", uplevel: 1
       DEFAULT_PARSER.unescape(*arg)
     end
     alias decode unescape
@@ -143,6 +142,20 @@ module URI
   # Returns a Hash of the defined schemes.
   def self.scheme_list
     @@schemes
+  end
+
+  #
+  # Construct a URI instance, using the scheme to detect the appropriate class
+  # from +URI.scheme_list+.
+  #
+  def self.for(scheme, *arguments, default: Generic)
+    if scheme
+      uri_class = @@schemes[scheme.upcase] || default
+    else
+      uri_class = default
+    end
+
+    return uri_class.new(scheme, *arguments)
   end
 
   #
@@ -362,7 +375,7 @@ module URI
   # If +enc+ is given, convert +str+ to the encoding before percent encoding.
   #
   # This is an implementation of
-  # http://www.w3.org/TR/2013/CR-html5-20130806/forms.html#url-encoded-form-data.
+  # https://www.w3.org/TR/2013/CR-html5-20130806/forms.html#url-encoded-form-data.
   #
   # See URI.decode_www_form_component, URI.encode_www_form.
   def self.encode_www_form_component(str, enc=nil)
@@ -370,7 +383,7 @@ module URI
     if str.encoding != Encoding::ASCII_8BIT
       if enc && enc != Encoding::ASCII_8BIT
         str.encode!(Encoding::UTF_8, invalid: :replace, undef: :replace)
-        str.encode!(enc, fallback: ->(x){"&#{x.ord};"})
+        str.encode!(enc, fallback: ->(x){"&##{x.ord};"})
       end
       str.force_encoding(Encoding::ASCII_8BIT)
     end
@@ -403,7 +416,7 @@ module URI
   # This method doesn't handle files.  When you send a file, use
   # multipart/form-data.
   #
-  # This refers http://url.spec.whatwg.org/#concept-urlencoded-serializer
+  # This refers https://url.spec.whatwg.org/#concept-urlencoded-serializer
   #
   #    URI.encode_www_form([["q", "ruby"], ["lang", "en"]])
   #    #=> "q=ruby&lang=en"

@@ -434,13 +434,24 @@ class TestISeq < Test::Unit::TestCase
   end
 
   def test_to_binary_pattern_matching
-    code = "case foo in []; end"
+    code = "case foo; in []; end"
     iseq = compile(code)
     assert_include(iseq.disasm, "TypeError")
     assert_include(iseq.disasm, "NoMatchingPatternError")
     EnvUtil.suppress_warning do
       assert_iseq_to_binary(code, "[Feature #14912]")
     end
+  end
+
+  def test_to_binary_dumps_nokey
+    iseq = assert_iseq_to_binary(<<-RUBY)
+      o = Object.new
+      class << o
+        def foo(**nil); end
+      end
+      o
+    RUBY
+    assert_equal([[:nokey]], iseq.eval.singleton_method(:foo).parameters)
   end
 
   def test_to_binary_line_info
@@ -454,6 +465,11 @@ class TestISeq < Test::Unit::TestCase
         attr_reader :i
       end
     end;
+
+    # cleanup
+    ::Object.class_eval do
+      remove_const :P
+    end
   end
 
   def collect_from_binary_tracepoint_lines(tracepoint_type, filename)
@@ -547,5 +563,22 @@ class TestISeq < Test::Unit::TestCase
       # ISeq objects should be same for same src
       assert_equal iseq1.object_id, iseq2.object_id
     }
+  end
+
+  def test_iseq_builtin_to_a
+    invokebuiltin = eval(EnvUtil.invoke_ruby(['-e', <<~EOS], '', true).first)
+      insns = RubyVM::InstructionSequence.of([].method(:pack)).to_a.last
+      p insns.find { |insn| insn.is_a?(Array) && insn[0] == :opt_invokebuiltin_delegate_leave }
+    EOS
+    assert_not_nil(invokebuiltin)
+    assert_equal([:func_ptr, :argc, :index, :name], invokebuiltin[1].keys)
+  end
+
+  def test_iseq_option_debug_level
+    assert_raise(TypeError) {ISeq.compile("", debug_level: "")}
+    assert_ruby_status([], "#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+      RubyVM::InstructionSequence.compile("", debug_level: 5)
+    end;
   end
 end

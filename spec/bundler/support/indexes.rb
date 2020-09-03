@@ -26,6 +26,10 @@ module Spec
         end
       end
       source_requirements ||= {}
+      args[0] ||= [] # base
+      args[1] ||= Bundler::GemVersionPromoter.new # gem_version_promoter
+      args[2] ||= [] # additional_base_requirements
+      args[3] ||= @platforms # platforms
       Bundler::Resolver.resolve(deps, @index, source_requirements, *args)
     end
 
@@ -45,7 +49,7 @@ module Spec
 
     def should_conflict_on(names)
       got = resolve
-      flunk "The resolve succeeded with: #{got.map(&:full_name).sort.inspect}"
+      raise "The resolve succeeded with: #{got.map(&:full_name).sort.inspect}"
     rescue Bundler::VersionConflict => e
       expect(Array(names).sort).to eq(e.conflicts.sort)
     end

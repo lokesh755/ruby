@@ -7,7 +7,6 @@
 #       From Original Idea of shugo@ruby-lang.org
 #
 
-require "readline"
 autoload :RDoc, "rdoc"
 
 module IRB
@@ -17,11 +16,12 @@ module IRB
     # Set of reserved words used by Ruby, you should not use these for
     # constants or variables
     ReservedWords = %w[
+      __ENCODING__ __LINE__ __FILE__
       BEGIN END
       alias and
       begin break
       case class
-      def defined do
+      def defined? do
       else elsif end ensure
       false for
       if in
@@ -42,9 +42,7 @@ module IRB
       retrieve_completion_data(input).compact.map{ |i| i.encode(Encoding.default_external) }
     }
 
-    def self.retrieve_completion_data(input, doc_namespace = false)
-      bind = IRB.conf[:MAIN_CONTEXT].workspace.binding
-
+    def self.retrieve_completion_data(input, bind: IRB.conf[:MAIN_CONTEXT].workspace.binding, doc_namespace: false)
       case input
       when /^((["'`]).*\2)\.([^.]*)$/
         # String
@@ -98,13 +96,13 @@ module IRB
       when /^(:[^:.]*)$/
         # Symbol
         return nil if doc_namespace
-        if Symbol.respond_to?(:all_symbols)
-          sym = $1
-          candidates = Symbol.all_symbols.collect{|s| ":" + s.id2name}
-          candidates.grep(/^#{Regexp.quote(sym)}/)
-        else
-          []
+        sym = $1
+        candidates = Symbol.all_symbols.collect do |s|
+          ":" + s.id2name.encode(Encoding.default_external)
+        rescue Encoding::UndefinedConversionError
+          # ignore
         end
+        candidates.grep(/^#{Regexp.quote(sym)}/)
 
       when /^::([A-Z][^:\.\(]*)$/
         # Absolute Constant or class methods
@@ -145,7 +143,7 @@ module IRB
           select_message(receiver, message, candidates, sep)
         end
 
-      when /^(?<num>-?(0[dbo])?[0-9_]+(\.[0-9_]+)?([eE][+-]?[0-9]+i?|r)?)(?<sep>\.|::)(?<mes>[^.]*)$/
+      when /^(?<num>-?(?:0[dbo])?[0-9_]+(?:\.[0-9_]+)?(?:(?:[eE][+-]?[0-9]+)?i?|r)?)(?<sep>\.|::)(?<mes>[^.]*)$/
         # Numeric
         receiver = $~[:num]
         sep = $~[:sep]
@@ -205,7 +203,7 @@ module IRB
         sep = $2
         message = Regexp.quote($3)
 
-        gv = eval("global_variables", bind).collect{|m| m.to_s}.append("true", "false", "nil")
+        gv = eval("global_variables", bind).collect{|m| m.to_s}.push("true", "false", "nil")
         lv = eval("local_variables", bind).collect{|m| m.to_s}
         iv = eval("instance_variables", bind).collect{|m| m.to_s}
         cv = eval("self.class.constants", bind).collect{|m| m.to_s}
@@ -257,7 +255,7 @@ module IRB
 
       else
         candidates = eval("methods | private_methods | local_variables | instance_variables | self.class.constants", bind).collect{|m| m.to_s}
-        conditions |= ReservedWords
+        candidates |= ReservedWords
 
         if doc_namespace
           candidates.find{ |i| i == input }
@@ -267,18 +265,14 @@ module IRB
       end
     end
 
-    PerfectMatchedProc = ->(matched) {
+    PerfectMatchedProc = ->(matched, bind: IRB.conf[:MAIN_CONTEXT].workspace.binding) {
       RDocRIDriver ||= RDoc::RI::Driver.new
       if matched =~ /\A(?:::)?RubyVM/ and not ENV['RUBY_YES_I_AM_NOT_A_NORMAL_USER']
-        File.open(File.join(__dir__, 'ruby_logo.aa')) do |f|
-          RDocRIDriver.page do |io|
-            IO.copy_stream(f, io)
-          end
-        end
+        IRB.send(:easter_egg)
         return
       end
-      namespace = retrieve_completion_data(matched, true)
-      return unless matched
+      namespace = retrieve_completion_data(matched, bind: bind, doc_namespace: true)
+      return unless namespace
       if namespace.is_a?(Array)
         out = RDoc::Markup::Document.new
         namespace.each do |m|
@@ -326,7 +320,7 @@ module IRB
         end
       end
 
-      %i(IRB SLex RubyLex RubyToken).each do |sym|
+      %i(IRB RubyLex).each do |sym|
         next unless Object.const_defined?(sym)
         scanner.call(Object.const_get(sym))
       end

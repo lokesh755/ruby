@@ -9,14 +9,24 @@
 
 **********************************************************************/
 
-#include "ruby/encoding.h"
-#include "internal.h"
-#include "encindex.h"
-#include "regenc.h"
-#include <ctype.h>
-#include "ruby/util.h"
+#include "ruby/internal/config.h"
 
+#include <ctype.h>
+
+#include "encindex.h"
+#include "internal.h"
+#include "internal/enc.h"
+#include "internal/encoding.h"
+#include "internal/inits.h"
+#include "internal/load.h"
+#include "internal/object.h"
+#include "internal/string.h"
+#include "internal/vm.h"
+#include "regenc.h"
+#include "ruby/encoding.h"
+#include "ruby/util.h"
 #include "ruby_assert.h"
+
 #ifndef ENC_DEBUG
 #define ENC_DEBUG 0
 #endif
@@ -266,7 +276,7 @@ enc_table_expand(int newsize)
 
     if (enc_table.size >= newsize) return newsize;
     newsize = (newsize + 7) / 8 * 8;
-    ent = xrealloc(enc_table.list, sizeof(*enc_table.list) * newsize);
+    ent = REALLOC_N(enc_table.list, struct rb_encoding_entry, newsize);
     memset(ent + enc_table.size, 0, sizeof(*ent)*(newsize - enc_table.size));
     enc_table.list = ent;
     enc_table.size = newsize;
@@ -649,12 +659,11 @@ load_encoding(const char *name)
 	else if (ISUPPER(*s)) *s = (char)TOLOWER(*s);
 	++s;
     }
-    FL_UNSET(enclib, FL_TAINT);
     enclib = rb_fstring(enclib);
     ruby_verbose = Qfalse;
     ruby_debug = Qfalse;
     errinfo = rb_errinfo();
-    loaded = rb_require_internal(enclib, rb_safe_level());
+    loaded = rb_require_internal(enclib);
     ruby_verbose = verbose;
     ruby_debug = debug;
     rb_set_errinfo(errinfo);
@@ -770,8 +779,18 @@ enc_get_index_str(VALUE str)
     if (i == ENCODING_INLINE_MAX) {
 	VALUE iv;
 
+#if 0
 	iv = rb_ivar_get(str, rb_id_encoding());
 	i = NUM2INT(iv);
+#else
+        /*
+         * Tentatively, assume ASCII-8BIT, if encoding index instance
+         * variable is not found.  This can happen when freeing after
+         * all instance variables are removed in `obj_free`.
+         */
+        iv = rb_attr_get(str, rb_id_encoding());
+        i = NIL_P(iv) ? ENCINDEX_ASCII : NUM2INT(iv);
+#endif
     }
     return i;
 }
@@ -910,7 +929,7 @@ enc_compatible_latter(VALUE str1, VALUE str2, int idx1, int idx2)
     if (isstr2 && RSTRING_LEN(str2) == 0)
 	return enc1;
     isstr1 = RB_TYPE_P(str1, T_STRING);
-    if (isstr1 && RSTRING_LEN(str1) == 0)
+    if (isstr1 && isstr2 && RSTRING_LEN(str1) == 0)
 	return (rb_enc_asciicompat(enc1) && rb_enc_str_asciionly_p(str2)) ? enc1 : enc2;
     if (!rb_enc_asciicompat(enc1) || !rb_enc_asciicompat(enc2)) {
 	return 0;
@@ -1175,7 +1194,7 @@ enc_names_i(st_data_t name, st_data_t idx, st_data_t args)
  *
  * Returns the list of name and aliases of the encoding.
  *
- *   Encoding::WINDOWS_31J.names  #=> ["Windows-31J", "CP932", "csWindows31J"]
+ *   Encoding::WINDOWS_31J.names  #=> ["Windows-31J", "CP932", "csWindows31J", "SJIS", "PCK"]
  */
 static VALUE
 enc_names(VALUE self)
@@ -1283,12 +1302,13 @@ enc_compatible_p(VALUE klass, VALUE str1, VALUE str2)
     return rb_enc_from_encoding(enc);
 }
 
+NORETURN(static VALUE enc_s_alloc(VALUE klass));
 /* :nodoc: */
 static VALUE
 enc_s_alloc(VALUE klass)
 {
     rb_undefined_alloc(klass);
-    return Qnil;
+    UNREACHABLE_RETURN(Qnil);
 }
 
 /* :nodoc: */
@@ -1356,7 +1376,7 @@ rb_locale_encindex(void)
 {
     int idx = rb_locale_charmap_index();
 
-    if (idx < 0) idx = ENCINDEX_ASCII;
+    if (idx < 0) idx = ENCINDEX_UTF_8;
 
     if (rb_enc_registered("locale") < 0) {
 # if defined _WIN32
@@ -1466,7 +1486,7 @@ rb_enc_default_external(void)
  * encoding may not be valid.  Be sure to check String#valid_encoding?.
  *
  * File data written to disk will be transcoded to the default external
- * encoding when written.
+ * encoding when written, if default_internal is not nil.
  *
  * The default external encoding is initialized by the locale or -E option.
  */
@@ -1551,8 +1571,7 @@ rb_enc_default_internal(void)
  * The script encoding (__ENCODING__), not default_internal, is used as the
  * encoding of created strings.
  *
- * Encoding::default_internal is initialized by the source file's
- * internal_encoding or -E option.
+ * Encoding::default_internal is initialized with -E option or nil otherwise.
  */
 static VALUE
 get_default_internal(VALUE klass)
@@ -1700,8 +1719,8 @@ rb_enc_aliases_enc_i(st_data_t name, st_data_t orig, st_data_t arg)
  * Returns the hash of available encoding alias and original encoding name.
  *
  *   Encoding.aliases
- *   #=> {"BINARY"=>"ASCII-8BIT", "ASCII"=>"US-ASCII", "ANSI_X3.4-1986"=>"US-ASCII",
- *         "SJIS"=>"Shift_JIS", "eucJP"=>"EUC-JP", "CP932"=>"Windows-31J"}
+ *   #=> {"BINARY"=>"ASCII-8BIT", "ASCII"=>"US-ASCII", "ANSI_X3.4-1968"=>"US-ASCII",
+ *         "SJIS"=>"Windows-31J", "eucJP"=>"EUC-JP", "CP932"=>"Windows-31J"}
  *
  */
 
@@ -1917,12 +1936,6 @@ rb_enc_aliases(VALUE klass)
  */
 
 void
-Init_encodings(void)
-{
-    rb_enc_init();
-}
-
-void
 Init_Encoding(void)
 {
 #undef rb_intern
@@ -1964,7 +1977,13 @@ Init_Encoding(void)
 	rb_ary_push(list, enc_new(enc_table.list[i].enc));
     }
 
-    rb_marshal_define_compat(rb_cEncoding, Qnil, NULL, enc_m_loader);
+    rb_marshal_define_compat(rb_cEncoding, Qnil, 0, enc_m_loader);
+}
+
+void
+Init_encodings(void)
+{
+    rb_enc_init();
 }
 
 /* locale insensitive ctype functions */

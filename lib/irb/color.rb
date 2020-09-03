@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 require 'reline'
 require 'ripper'
+require 'irb/ruby-lex'
 
 module IRB # :nodoc:
   module Color
@@ -30,7 +31,7 @@ module IRB # :nodoc:
       # backtick and regexp as red (string's color, because they're sharing tokens).
       TOKEN_SEQ_EXPRS = {
         on_CHAR:            [[BLUE, BOLD],            ALL],
-        on_backtick:        [[RED],                   ALL],
+        on_backtick:        [[RED, BOLD],             ALL],
         on_comment:         [[BLUE, BOLD],            ALL],
         on_const:           [[BLUE, BOLD, UNDERLINE], ALL],
         on_embexpr_beg:     [[RED],                   ALL],
@@ -45,17 +46,18 @@ module IRB # :nodoc:
         on_int:             [[BLUE, BOLD],            ALL],
         on_kw:              [[GREEN],                 ALL],
         on_label:           [[MAGENTA],               ALL],
-        on_label_end:       [[RED],                   ALL],
-        on_qsymbols_beg:    [[RED],                   ALL],
-        on_qwords_beg:      [[RED],                   ALL],
+        on_label_end:       [[RED, BOLD],             ALL],
+        on_qsymbols_beg:    [[RED, BOLD],             ALL],
+        on_qwords_beg:      [[RED, BOLD],             ALL],
         on_rational:        [[BLUE, BOLD],            ALL],
         on_regexp_beg:      [[RED, BOLD],             ALL],
         on_regexp_end:      [[RED, BOLD],             ALL],
         on_symbeg:          [[YELLOW],                ALL],
-        on_tstring_beg:     [[RED],                   ALL],
+        on_symbols_beg:     [[RED, BOLD],             ALL],
+        on_tstring_beg:     [[RED, BOLD],             ALL],
         on_tstring_content: [[RED],                   ALL],
-        on_tstring_end:     [[RED],                   ALL],
-        on_words_beg:       [[RED],                   ALL],
+        on_tstring_end:     [[RED, BOLD],             ALL],
+        on_words_beg:       [[RED, BOLD],             ALL],
         on_parse_error:     [[RED, REVERSE],          ALL],
         compile_error:      [[RED, REVERSE],          ALL],
       }
@@ -70,16 +72,20 @@ module IRB # :nodoc:
         $stdout.tty? && supported? && (/mswin|mingw/ =~ RUBY_PLATFORM || (ENV.key?('TERM') && ENV['TERM'] != 'dumb'))
       end
 
-      def inspect_colorable?(obj)
+      def inspect_colorable?(obj, seen: {}.compare_by_identity)
         case obj
         when String, Symbol, Regexp, Integer, Float, FalseClass, TrueClass, NilClass
           true
         when Hash
-          obj.all? { |k, v| inspect_colorable?(k) && inspect_colorable?(v) }
+          without_circular_ref(obj, seen: seen) do
+            obj.all? { |k, v| inspect_colorable?(k, seen: seen) && inspect_colorable?(v, seen: seen) }
+          end
         when Array
-          obj.all? { |o| inspect_colorable?(o) }
+          without_circular_ref(obj, seen: seen) do
+            obj.all? { |o| inspect_colorable?(o, seen: seen) }
+          end
         when Range
-          inspect_colorable?(obj.begin) && inspect_colorable?(obj.end)
+          inspect_colorable?(obj.begin, seen: seen) && inspect_colorable?(obj.end, seen: seen)
         when Module
           !obj.name.nil?
         else
@@ -132,38 +138,49 @@ module IRB # :nodoc:
 
       private
 
-      # Ripper::Lexer::Elem#state is supported on Ruby 2.5+
+      def without_circular_ref(obj, seen:, &block)
+        return false if seen.key?(obj)
+        seen[obj] = true
+        block.call
+      ensure
+        seen.delete(obj)
+      end
+
       def supported?
         return @supported if defined?(@supported)
-        @supported = Gem::Version.new(RUBY_VERSION) >= Gem::Version.new('2.5.0')
+        @supported = Ripper::Lexer::Elem.method_defined?(:state)
       end
 
       def scan(code, allow_last_error:)
         pos = [1, 0]
 
-        lexer = Ripper::Lexer.new(code)
-        if lexer.respond_to?(:scan) # Ruby 2.7+
-          lexer.scan.each do |elem|
-            str = elem.tok
-            next if allow_last_error and /meets end of file|unexpected end-of-input/ =~ elem.message
-            next if ([elem.pos[0], elem.pos[1] + str.bytesize] <=> pos) <= 0
+        verbose, $VERBOSE = $VERBOSE, nil
+        RubyLex.compile_with_errors_suppressed(code) do |inner_code, line_no|
+          lexer = Ripper::Lexer.new(inner_code, '(ripper)', line_no)
+          if lexer.respond_to?(:scan) # Ruby 2.7+
+            lexer.scan.each do |elem|
+              str = elem.tok
+              next if allow_last_error and /meets end of file|unexpected end-of-input/ =~ elem.message
+              next if ([elem.pos[0], elem.pos[1] + str.bytesize] <=> pos) <= 0
 
-            str.each_line do |line|
-              if line.end_with?("\n")
-                pos[0] += 1
-                pos[1] = 0
-              else
-                pos[1] += line.bytesize
+              str.each_line do |line|
+                if line.end_with?("\n")
+                  pos[0] += 1
+                  pos[1] = 0
+                else
+                  pos[1] += line.bytesize
+                end
               end
-            end
 
-            yield(elem.event, str, elem.state)
-          end
-        else
-          lexer.parse.each do |elem|
-            yield(elem.event, elem.tok, elem.state)
+              yield(elem.event, str, elem.state)
+            end
+          else
+            lexer.parse.each do |elem|
+              yield(elem.event, elem.tok, elem.state)
+            end
           end
         end
+        $VERBOSE = verbose
       end
 
       def dispatch_seq(token, expr, str, in_symbol:)
@@ -192,7 +209,7 @@ module IRB # :nodoc:
       def scan_token(token)
         prev_state = @stack.last
         case token
-        when :on_symbeg
+        when :on_symbeg, :on_symbols_beg, :on_qsymbols_beg
           @stack << true
         when :on_ident, :on_op, :on_const, :on_ivar, :on_cvar, :on_gvar, :on_kw
           if @stack.last # Pop only when it's Symbol

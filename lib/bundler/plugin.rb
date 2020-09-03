@@ -4,11 +4,11 @@ require_relative "plugin/api"
 
 module Bundler
   module Plugin
-    autoload :DSL,        "bundler/plugin/dsl"
-    autoload :Events,     "bundler/plugin/events"
-    autoload :Index,      "bundler/plugin/index"
-    autoload :Installer,  "bundler/plugin/installer"
-    autoload :SourceList, "bundler/plugin/source_list"
+    autoload :DSL,        File.expand_path("plugin/dsl", __dir__)
+    autoload :Events,     File.expand_path("plugin/events", __dir__)
+    autoload :Index,      File.expand_path("plugin/index", __dir__)
+    autoload :Installer,  File.expand_path("plugin/installer", __dir__)
+    autoload :SourceList, File.expand_path("plugin/source_list", __dir__)
 
     class MalformattedPlugin < PluginError; end
     class UndefinedCommandError < PluginError; end
@@ -45,6 +45,32 @@ module Bundler
       end
 
       Bundler.ui.error "Failed to install plugin #{name}: #{e.message}\n  #{e.backtrace.join("\n ")}"
+    end
+
+    # Uninstalls plugins by the given names
+    #
+    # @param [Array<String>] names the names of plugins to be uninstalled
+    def uninstall(names, options)
+      if names.empty? && !options[:all]
+        Bundler.ui.error "No plugins to uninstall. Specify at least 1 plugin to uninstall.\n"\
+          "Use --all option to uninstall all the installed plugins."
+        return
+      end
+
+      names = index.installed_plugins if options[:all]
+      if names.any?
+        names.each do |name|
+          if index.installed?(name)
+            Bundler.rm_rf(index.plugin_path(name))
+            index.unregister_plugin(name)
+            Bundler.ui.info "Uninstalled plugin #{name}"
+          else
+            Bundler.ui.error "Plugin #{name} is not installed \n"
+          end
+        end
+      else
+        Bundler.ui.info "No plugins installed"
+      end
     end
 
     # List installed plugins and commands

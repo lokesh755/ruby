@@ -2183,6 +2183,14 @@ class TestTranscode < Test::Unit::TestCase
     assert_equal("U+3042", "\u{3042}".encode("US-ASCII", fallback: fallback.method(:escape)))
   end
 
+  def test_fallback_aref
+    fallback = Object.new
+    def fallback.[](x)
+      "U+%.4X" % x.unpack("U")
+    end
+    assert_equal("U+3042", "\u{3042}".encode("US-ASCII", fallback: fallback))
+  end
+
   bug8940 = '[ruby-core:57318] [Bug #8940]'
   %w[UTF-32 UTF-16].each do |enc|
     define_method("test_pseudo_encoding_inspect(#{enc})") do
@@ -2242,12 +2250,19 @@ class TestTranscode < Test::Unit::TestCase
                  "#{bug} coderange should not have side effects")
   end
 
-  def test_universal_newline
+  def test_newline_options
     bug11324 = '[ruby-core:69841] [Bug #11324]'
     usascii = Encoding::US_ASCII
     s = "A\nB\r\nC".force_encoding(usascii)
     assert_equal("A\nB\nC", s.encode(usascii, universal_newline: true), bug11324)
     assert_equal("A\nB\nC", s.encode(usascii, universal_newline: true, undef: :replace), bug11324)
     assert_equal("A\nB\nC", s.encode(usascii, universal_newline: true, undef: :replace, replace: ''), bug11324)
+    assert_equal("A\nB\nC", s.encode(usascii, newline: :universal))
+    assert_equal("A\nB\nC", s.encode(usascii, newline: :universal, undef: :replace))
+    assert_equal("A\nB\nC", s.encode(usascii, newline: :universal, undef: :replace, replace: ''))
+    assert_equal("A\rB\r\rC", s.encode(usascii, cr_newline: true))
+    assert_equal("A\rB\r\rC", s.encode(usascii, newline: :cr))
+    assert_equal("A\r\nB\r\r\nC", s.encode(usascii, crlf_newline: true))
+    assert_equal("A\r\nB\r\r\nC", s.encode(usascii, newline: :crlf))
   end
 end

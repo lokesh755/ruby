@@ -6,7 +6,6 @@ RSpec.describe "real source plugins" do
       build_repo2 do
         build_plugin "bundler-source-mpath" do |s|
           s.write "plugins.rb", <<-RUBY
-            require "bundler/vendored_fileutils"
             require "bundler-source-mpath"
 
             class MPath < Bundler::Plugin::API
@@ -126,14 +125,14 @@ RSpec.describe "real source plugins" do
     end
 
     it "installs the gem executables" do
-      build_lib "gem-with-bin" do |s|
+      build_lib "gem_with_bin" do |s|
         s.executables = ["foo"]
       end
 
       install_gemfile <<-G
         source "#{file_uri_for(gem_repo2)}" # plugin source
-        source "#{lib_path("gem-with-bin-1.0")}", :type => :mpath do
-          gem "gem-with-bin"
+        source "#{lib_path("gem_with_bin-1.0")}", :type => :mpath do
+          gem "gem_with_bin"
         end
       G
 
@@ -156,10 +155,11 @@ RSpec.describe "real source plugins" do
         expect(the_bundle).to include_gems("a-path-gem 1.0")
       end
 
-      it "copies repository to vendor cache and uses it even when installed with bundle --path" do
-        bundle! :install, forgotten_command_line_options(:path => "vendor/bundle")
+      it "copies repository to vendor cache and uses it even when installed with `path` configured" do
+        bundle "config --local path vendor/bundle"
+        bundle :install
         bundle "config set cache_all true"
-        bundle! :cache
+        bundle :cache
 
         expect(bundled_app("vendor/cache/a-path-gem-1.0-#{uri_hash}")).to exist
 
@@ -168,9 +168,10 @@ RSpec.describe "real source plugins" do
       end
 
       it "bundler package copies repository to vendor cache" do
-        bundle! :install, forgotten_command_line_options(:path => "vendor/bundle")
+        bundle "config --local path vendor/bundle"
+        bundle :install
         bundle "config set cache_all true"
-        bundle! :package
+        bundle :cache
 
         expect(bundled_app("vendor/cache/a-path-gem-1.0-#{uri_hash}")).to exist
 
@@ -204,7 +205,7 @@ RSpec.describe "real source plugins" do
       end
 
       it "installs" do
-        bundle! "install"
+        bundle "install"
 
         expect(the_bundle).to include_gems("a-path-gem 1.0")
       end
@@ -216,6 +217,8 @@ RSpec.describe "real source plugins" do
       build_repo2 do
         build_plugin "bundler-source-gitp" do |s|
           s.write "plugins.rb", <<-RUBY
+            require "open3"
+
             class SPlugin < Bundler::Plugin::API
               source "gitp"
 
@@ -255,9 +258,7 @@ RSpec.describe "real source plugins" do
                 mkdir_p(install_path.dirname)
                 rm_rf(install_path)
                 `git clone --no-checkout --quiet "\#{cache_path}" "\#{install_path}"`
-                Dir.chdir install_path do
-                  `git reset --hard \#{revision}`
-                end
+                Open3.capture2e("git reset --hard \#{revision}", :chdir => install_path)
 
                 spec_path = install_path.join("\#{spec.full_name}.gemspec")
                 spec_path.open("wb") {|f| f.write spec.to_ruby }
@@ -311,9 +312,8 @@ RSpec.describe "real source plugins" do
                   cache_repo
                 end
 
-                Dir.chdir cache_path do
-                  `git rev-parse --verify \#{@ref}`.strip
-                end
+                output, _status = Open3.capture2e("git rev-parse --verify \#{@ref}", :chdir => cache_path)
+                output.strip
               end
 
               def base_name
@@ -452,7 +452,7 @@ RSpec.describe "real source plugins" do
         bundle "install"
 
         run <<-RUBY
-          require 'ma-gitp-gem'
+          require 'ma/gitp/gem'
           puts "WIN" unless defined?(MAGITPGEM_PREV_REF)
         RUBY
         expect(out).to eq("WIN")
@@ -463,7 +463,7 @@ RSpec.describe "real source plugins" do
         bundle "update ma-gitp-gem"
 
         run <<-RUBY
-          require 'ma-gitp-gem'
+          require 'ma/gitp/gem'
           puts "WIN" if defined?(MAGITPGEM_PREV_REF)
         RUBY
         expect(out).to eq("WIN")

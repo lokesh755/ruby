@@ -1,3 +1,5 @@
+#ifndef RUBY_INSNHELPER_H
+#define RUBY_INSNHELPER_H
 /**********************************************************************
 
   insnhelper.h - helper macros to implement each instructions
@@ -8,9 +10,6 @@
   Copyright (C) 2004-2007 Koichi Sasada
 
 **********************************************************************/
-
-#ifndef RUBY_INSNHELPER_H
-#define RUBY_INSNHELPER_H
 
 RUBY_SYMBOL_EXPORT_BEGIN
 
@@ -120,9 +119,13 @@ enum vm_regan_acttype {
  * because inline method cache does not care about receiver.
  */
 
-#define CC_SET_FASTPATH(cc, func, enabled) do { \
-    if (LIKELY(enabled)) ((cc)->call = (func)); \
-} while (0)
+static inline void
+CC_SET_FASTPATH(const struct rb_callcache *cc, vm_call_handler func, bool enabled)
+{
+    if (LIKELY(enabled)) {
+        vm_cc_call_set(cc, func);
+    }
+}
 
 #define GET_BLOCK_HANDLER() (GET_LEP()[VM_ENV_DATA_INDEX_SPECVAL])
 
@@ -136,27 +139,27 @@ enum vm_regan_acttype {
 /**********************************************************/
 
 #if VM_CHECK_MODE > 0
-#define SETUP_CANARY() \
-    VALUE *canary; \
-    if (leaf) { \
+#define SETUP_CANARY(cond) \
+    VALUE *canary = 0; \
+    if (cond) { \
         canary = GET_SP(); \
         SET_SV(vm_stack_canary); \
     } \
     else {\
         SET_SV(Qfalse); /* cleanup */ \
     }
-#define CHECK_CANARY() \
-    if (leaf) { \
+#define CHECK_CANARY(cond, insn) \
+    if (cond) { \
         if (*canary == vm_stack_canary) { \
             *canary = Qfalse; /* cleanup */ \
         } \
         else { \
-            vm_canary_is_found_dead(INSN_ATTR(bin), *canary); \
+            vm_canary_is_found_dead(insn, *canary); \
         } \
     }
 #else
-#define SETUP_CANARY()          /* void */
-#define CHECK_CANARY()          /* void */
+#define SETUP_CANARY(cond)       if (cond) {} else {}
+#define CHECK_CANARY(cond, insn) if (cond) {(void)(insn);}
 #endif
 
 /**********************************************************/
@@ -166,13 +169,14 @@ enum vm_regan_acttype {
 #ifndef MJIT_HEADER
 #define CALL_SIMPLE_METHOD() do { \
     rb_snum_t x = leaf ? INSN_ATTR(width) : 0; \
-    rb_snum_t y = attr_width_opt_send_without_block(0, 0); \
+    rb_snum_t y = attr_width_opt_send_without_block(0); \
     rb_snum_t z = x - y; \
     ADD_PC(z); \
     DISPATCH_ORIGINAL_INSN(opt_send_without_block); \
 } while (0)
 #endif
 
+#define PREV_CLASS_SERIAL() (ruby_vm_class_serial)
 #define NEXT_CLASS_SERIAL() (++ruby_vm_class_serial)
 #define GET_GLOBAL_METHOD_STATE() (ruby_vm_global_method_state)
 #define INC_GLOBAL_METHOD_STATE() (++ruby_vm_global_method_state)
@@ -238,16 +242,19 @@ THROW_DATA_CONSUMED_SET(struct vm_throw_data *obj)
     }
 }
 
-#define IS_ARGS_SPLAT(ci)   ((ci)->flag & VM_CALL_ARGS_SPLAT)
-#define IS_ARGS_KEYWORD(ci) ((ci)->flag & VM_CALL_KWARG)
+#define IS_ARGS_SPLAT(ci)          (vm_ci_flag(ci) & VM_CALL_ARGS_SPLAT)
+#define IS_ARGS_KEYWORD(ci)        (vm_ci_flag(ci) & VM_CALL_KWARG)
+#define IS_ARGS_KW_SPLAT(ci)       (vm_ci_flag(ci) & VM_CALL_KW_SPLAT)
+#define IS_ARGS_KW_OR_KW_SPLAT(ci) (vm_ci_flag(ci) & (VM_CALL_KWARG | VM_CALL_KW_SPLAT))
+#define IS_ARGS_KW_SPLAT_MUT(ci)   (vm_ci_flag(ci) & VM_CALL_KW_SPLAT_MUT)
 
 /* If this returns true, an optimized function returned by `vm_call_iseq_setup_func`
    can be used as a fastpath. */
 static bool
-vm_call_iseq_optimizable_p(const struct rb_call_info *ci, const struct rb_call_cache *cc)
+vm_call_iseq_optimizable_p(const struct rb_callinfo *ci, const struct rb_callcache *cc)
 {
     return !IS_ARGS_SPLAT(ci) && !IS_ARGS_KEYWORD(ci) &&
-        !(METHOD_ENTRY_VISI(cc->me) == METHOD_VISI_PROTECTED);
+        METHOD_ENTRY_CACHEABLE(vm_cc_cme(cc));
 }
 
 #endif /* RUBY_INSNHELPER_H */

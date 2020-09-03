@@ -5,11 +5,9 @@
 # See LICENSE.txt for permissions.
 #++
 
-require 'rubygems/user_interaction'
-require "open3"
+require_relative '../user_interaction'
 
 class Gem::Ext::Builder
-
   include Gem::UserInteraction
 
   ##
@@ -68,7 +66,10 @@ class Gem::Ext::Builder
       results << "current directory: #{Dir.pwd}"
       results << (command.respond_to?(:shelljoin) ? command.shelljoin : command)
 
-      output, status = Open3.capture2e(*command)
+      require "open3"
+      # Set $SOURCE_DATE_EPOCH for the subprocess.
+      env = {'SOURCE_DATE_EPOCH' => Gem.source_date_epoch_string}
+      output, status = Open3.capture2e(env, *command)
       if verbose
         puts output
       else
@@ -108,7 +109,7 @@ class Gem::Ext::Builder
     @build_args = build_args
     @gem_dir    = spec.full_gem_path
 
-    @ran_rake   = false
+    @ran_rake = false
   end
 
   ##
@@ -225,5 +226,4 @@ EOF
 
     destination
   end
-
 end

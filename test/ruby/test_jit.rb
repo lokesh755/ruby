@@ -3,8 +3,6 @@ require 'test/unit'
 require 'tmpdir'
 require_relative '../lib/jit_support'
 
-return if RbConfig::CONFIG["MJIT_SUPPORT"] == 'no'
-
 # Test for --jit option
 class TestJIT < Test::Unit::TestCase
   include JITSupport
@@ -14,40 +12,61 @@ class TestJIT < Test::Unit::TestCase
     /\AJIT inline: .+\n\z/,
     /\ASuccessful MJIT finish\n\z/,
   ]
+  MAX_CACHE_PATTERNS = [
+    /\AJIT compaction \([^)]+\): .+\n\z/,
+    /\AToo many JIT code, but skipped unloading units for JIT compaction\n\z/,
+    /\ANo units can be unloaded -- .+\n\z/,
+  ]
 
   # trace_* insns are not compiled for now...
   TEST_PENDING_INSNS = RubyVM::INSTRUCTION_NAMES.select { |n| n.start_with?('trace_') }.map(&:to_sym) + [
     # not supported yet
     :defineclass,
-    :opt_call_c_function,
 
-    # joke
-    :bitblt,
-    :answer,
+    # to be tested
+    :invokebuiltin,
 
-    # TODO: write tests for them
-    :reput,
-    :tracecoverage,
-  ]
+    # never used
+    :opt_invokebuiltin_delegate,
+  ].each do |insn|
+    if !RubyVM::INSTRUCTION_NAMES.include?(insn.to_s)
+      warn "instruction #{insn.inspect} is not defined but included in TestJIT::TEST_PENDING_INSNS"
+    end
+  end
 
   def self.untested_insns
     @untested_insns ||= (RubyVM::INSTRUCTION_NAMES.map(&:to_sym) - TEST_PENDING_INSNS)
+  end
+
+  def self.setup
+    return if defined?(@setup_hooked)
+    @setup_hooked = true
+
+    # ci.rvm.jp caches its build environment. Clean up temporary files left by SEGV.
+    if ENV['RUBY_DEBUG']&.include?('ci')
+      Dir.glob("#{ENV.fetch('TMPDIR', '/tmp')}/_ruby_mjit_p*u*.*").each do |file|
+        if File.mtime(file) < Time.now - 60 * 60 * 24
+          puts "test/ruby/test_jit.rb: removing #{file}"
+          File.unlink(file)
+        end
+      end
+    end
+
+    # ruby -w -Itest/lib test/ruby/test_jit.rb
+    if $VERBOSE
+      at_exit do
+        unless TestJIT.untested_insns.empty?
+          warn "you may want to add tests for following insns, when you have a chance: #{TestJIT.untested_insns.join(' ')}"
+        end
+      end
+    end
   end
 
   def setup
     unless JITSupport.supported?
       skip 'JIT seems not supported on this platform'
     end
-
-    # ruby -w -Itest/lib test/ruby/test_jit.rb
-    if $VERBOSE && !defined?(@@at_exit_hooked)
-      at_exit do
-        unless TestJIT.untested_insns.empty?
-          warn "you may want to add tests for following insns, when you have a chance: #{TestJIT.untested_insns.join(' ')}"
-        end
-      end
-      @@at_exit_hooked = true
-    end
+    self.class.setup
   end
 
   def test_compile_insn_nop
@@ -112,13 +131,10 @@ class TestJIT < Test::Unit::TestCase
   end
 
   def test_compile_insn_setspecial
-    verbose_bak, $VERBOSE = $VERBOSE, nil
     assert_compile_once("#{<<~"begin;"}\n#{<<~"end;"}", result_inspect: 'true', insns: %i[setspecial])
     begin;
       true if nil.nil?..nil.nil?
     end;
-  ensure
-    $VERBOSE = verbose_bak
   end
 
   def test_compile_insn_instancevariable
@@ -251,6 +267,10 @@ class TestJIT < Test::Unit::TestCase
     end;
   end
 
+  def test_compile_insn_newarraykwsplat
+    assert_compile_once('[**{ x: 1 }]', result_inspect: '[{:x=>1}]', insns: %i[newarraykwsplat])
+  end
+
   def test_compile_insn_intern_duparray
     assert_compile_once('[:"#{0}"] + [1,2,3]', result_inspect: '[:"0", 1, 2, 3]', insns: %i[intern duparray])
   end
@@ -352,7 +372,7 @@ class TestJIT < Test::Unit::TestCase
   end
 
   def test_compile_insn_send
-    assert_eval_with_jit("#{<<~"begin;"}\n#{<<~"end;"}", stdout: '1', success_count: 2, insns: %i[send])
+    assert_eval_with_jit("#{<<~"begin;"}\n#{<<~"end;"}", stdout: '1', success_count: 3, insns: %i[send])
     begin;
       print proc { yield_self { 1 } }.call
     end;
@@ -482,13 +502,6 @@ class TestJIT < Test::Unit::TestCase
     end;
   end
 
-  def test_compile_insn_methodref
-    assert_compile_once("#{<<~"begin;"}\n#{<<~'end;'}", result_inspect: '"main"', insns: %i[methodref])
-    begin;
-      self.:inspect.call
-    end;
-  end
-
   def test_compile_insn_inlinecache
     assert_compile_once('Struct', result_inspect: 'Struct', insns: %i[opt_getinlinecache opt_setinlinecache])
   end
@@ -594,16 +607,18 @@ class TestJIT < Test::Unit::TestCase
     assert_compile_once('!!true', result_inspect: 'true', insns: %i[opt_not])
   end
 
-  def test_compile_insn_opt_regexpmatch1
-    assert_compile_once("/true/ =~ 'true'", result_inspect: '0', insns: %i[opt_regexpmatch1])
-  end
-
   def test_compile_insn_opt_regexpmatch2
+    assert_compile_once("/true/ =~ 'true'", result_inspect: '0', insns: %i[opt_regexpmatch2])
     assert_compile_once("'true' =~ /true/", result_inspect: '0', insns: %i[opt_regexpmatch2])
   end
 
-  def test_compile_insn_opt_call_c_function
-    skip "support this in opt_call_c_function (low priority)"
+  def test_compile_insn_opt_invokebuiltin_delegate_leave
+    iseq = eval(EnvUtil.invoke_ruby(['-e', <<~'EOS'], '', true).first)
+      p RubyVM::InstructionSequence.of("\x00".method(:unpack)).to_a
+    EOS
+    insns = collect_insns(iseq)
+    mark_tested_insn(:opt_invokebuiltin_delegate_leave, used_insns: insns)
+    assert_eval_with_jit('print "\x00".unpack("c")', stdout: '[0]', success_count: 1)
   end
 
   def test_jit_output
@@ -611,6 +626,46 @@ class TestJIT < Test::Unit::TestCase
     assert_equal("MJIT\n" * 5, out)
     assert_match(/^#{JIT_SUCCESS_PREFIX}: block in <main>@-e:1 -> .+_ruby_mjit_p\d+u\d+\.c$/, err)
     assert_match(/^Successful MJIT finish$/, err)
+  end
+
+  def test_nothing_to_unload_with_jit_wait
+    assert_eval_with_jit("#{<<~"begin;"}\n#{<<~"end;"}", stdout: 'hello', success_count: 11, max_cache: 10, ignorable_patterns: MAX_CACHE_PATTERNS)
+    begin;
+      def a1() a2() end
+      def a2() a3() end
+      def a3() a4() end
+      def a4() a5() end
+      def a5() a6() end
+      def a6() a7() end
+      def a7() a8() end
+      def a8() a9() end
+      def a9() a10() end
+      def a10() a11() end
+      def a11() print('hello') end
+      a1
+    end;
+  end
+
+  def test_unload_units_on_fiber
+    assert_eval_with_jit("#{<<~"begin;"}\n#{<<~"end;"}", stdout: 'hello', success_count: 12, max_cache: 10, ignorable_patterns: MAX_CACHE_PATTERNS)
+    begin;
+      def a1() a2(false); a2(true) end
+      def a2(a) a3(a) end
+      def a3(a) a4(a) end
+      def a4(a) a5(a) end
+      def a5(a) a6(a) end
+      def a6(a) a7(a) end
+      def a7(a) a8(a) end
+      def a8(a) a9(a) end
+      def a9(a) a10(a) end
+      def a10(a)
+        if a
+          Fiber.new { a11 }.resume
+        end
+      end
+      def a11() print('hello') end
+      a1
+    end;
   end
 
   def test_unload_units_and_compaction
@@ -639,17 +694,22 @@ class TestJIT < Test::Unit::TestCase
       debug_info = %Q[stdout:\n"""\n#{out}\n"""\n\nstderr:\n"""\n#{err}"""\n]
       assert_equal('012345678910', out, debug_info)
       compactions, errs = err.lines.partition do |l|
-        l.match?(/\AJIT compaction \(\d+\.\dms\): Compacted \d+ methods ->/)
+        l.match?(/\AJIT compaction \(\d+\.\dms\): Compacted \d+ methods /)
       end
       10.times do |i|
         assert_match(/\A#{JIT_SUCCESS_PREFIX}: mjit#{i}@\(eval\):/, errs[i], debug_info)
       end
-      assert_equal("Too many JIT code -- 1 units unloaded\n", errs[10], debug_info)
-      assert_match(/\A#{JIT_SUCCESS_PREFIX}: mjit10@\(eval\):/, errs[11], debug_info)
 
       # On --jit-wait, when the number of JIT-ed code reaches --jit-max-cache,
       # it should trigger compaction.
-      unless RUBY_PLATFORM.match?(/mswin|mingw/) # compaction is not supported on Windows yet
+      if RUBY_PLATFORM.match?(/mswin|mingw/) # compaction is not supported on Windows yet
+        assert_equal("Too many JIT code -- 1 units unloaded\n", errs[10], debug_info)
+        assert_match(/\A#{JIT_SUCCESS_PREFIX}: mjit10@\(eval\):/, errs[11], debug_info)
+      else
+        assert_equal("Too many JIT code, but skipped unloading units for JIT compaction\n", errs[10], debug_info)
+        assert_equal("No units can be unloaded -- incremented max-cache-size to 11 for --jit-wait\n", errs[11], debug_info)
+        assert_match(/\A#{JIT_SUCCESS_PREFIX}: mjit10@\(eval\):/, errs[12], debug_info)
+
         assert_equal(3, compactions.size, debug_info)
       end
 
@@ -657,10 +717,20 @@ class TestJIT < Test::Unit::TestCase
         # "Permission Denied" error is preventing to remove so file on AppVeyor/RubyCI.
         skip 'Removing so file is randomly failing on AppVeyor/RubyCI mswin due to Permission Denied.'
       else
-        # verify .o files are deleted on unload_units
+        # verify .c files are deleted on unload_units
         assert_send([Dir, :empty?, dir], debug_info)
       end
     end
+  end
+
+  def test_newarraykwsplat_on_stack
+    assert_eval_with_jit("#{<<~"begin;"}\n#{<<~"end;"}", stdout: "[nil, [{:type=>:development}]]\n", success_count: 1, insns: %i[newarraykwsplat])
+    begin;
+      def arr
+        [nil, [:type => :development]]
+      end
+      p arr
+    end;
   end
 
   def test_local_stack_on_exception
@@ -722,6 +792,43 @@ class TestJIT < Test::Unit::TestCase
     end;
   end
 
+  def test_inlined_c_method
+    assert_eval_with_jit("#{<<~"begin;"}\n#{<<~"end;"}", stdout: "aaa", success_count: 2, recompile_count: 1, min_calls: 2)
+    begin;
+      def test(obj, recursive: nil)
+        if recursive
+          test(recursive)
+        end
+        obj.to_s
+      end
+
+      print(test('a')) # set #to_s cc to String#to_s (expecting C method)
+      print(test('a')) # JIT with #to_s cc: String#to_s
+      # update #to_s cd->cc to Symbol#to_s, then go through the Symbol#to_s cd->cc
+      # after checking receiver class using inlined #to_s cc with String#to_s.
+      print(test('a', recursive: :foo))
+    end;
+  end
+
+  def test_inlined_exivar
+    assert_eval_with_jit("#{<<~"begin;"}\n#{<<~"end;"}", stdout: "aaa", success_count: 3, recompile_count: 1, min_calls: 2)
+    begin;
+      class Foo < Hash
+        def initialize
+          @a = :a
+        end
+
+        def bar
+          @a
+        end
+      end
+
+      print(Foo.new.bar)
+      print(Foo.new.bar) # compile #initialize, #bar -> recompile #bar
+      print(Foo.new.bar) # compile #bar with exivar
+    end;
+  end
+
   def test_inlined_undefined_ivar
     assert_eval_with_jit("#{<<~"begin;"}\n#{<<~"end;"}", stdout: "bbb", success_count: 3, min_calls: 3)
     begin;
@@ -742,6 +849,28 @@ class TestJIT < Test::Unit::TestCase
       print(Foo.new.bar)
       print(Foo.new.bar)
       $VERBOSE = verbose
+    end;
+  end
+
+  def test_inlined_setivar_frozen
+    assert_eval_with_jit("#{<<~"begin;"}\n#{<<~"end;"}", stdout: "FrozenError\n", success_count: 2, min_calls: 3)
+    begin;
+      class A
+        def a
+          @a = 1
+        end
+      end
+
+      a = A.new
+      a.a
+      a.a
+      a.a
+      a.freeze
+      begin
+        a.a
+      rescue FrozenError => e
+        p e.class
+      end
     end;
   end
 
@@ -809,6 +938,44 @@ class TestJIT < Test::Unit::TestCase
     end;
   end
 
+  def test_heap_promotion_of_ivar_in_the_middle_of_jit
+    assert_eval_with_jit("#{<<~"begin;"}\n#{<<~"end;"}", stdout: "true\ntrue\n", success_count: 2, min_calls: 2)
+    begin;
+      class A
+        def initialize
+          @iv0 = nil
+          @iv1 = []
+          @iv2 = nil
+        end
+
+        def test(add)
+          @iv0.nil?
+          @iv2.nil?
+          add_ivar if add
+          @iv1.empty?
+        end
+
+        def add_ivar
+          @iv3 = nil
+        end
+      end
+
+      a = A.new
+      p a.test(false)
+      p a.test(true)
+    end;
+  end
+
+  def test_jump_to_precompiled_branch
+    assert_eval_with_jit("#{<<~'begin;'}\n#{<<~'end;'}", stdout: ".0", success_count: 1, min_calls: 1)
+    begin;
+      def test(foo)
+        ".#{foo unless foo == 1}" if true
+      end
+      print test(0)
+    end;
+  end
+
   def test_clean_so
     if RUBY_PLATFORM.match?(/mswin/)
       skip 'Removing so file is randomly failing on AppVeyor/RubyCI mswin due to Permission Denied.'
@@ -859,6 +1026,22 @@ class TestJIT < Test::Unit::TestCase
     end;
   end
 
+  def test_frame_omitted_inlining
+    assert_eval_with_jit("#{<<~"begin;"}\n#{<<~"end;"}", stdout: "true\ntrue\ntrue\n", success_count: 1, min_calls: 2)
+    begin;
+      class Integer
+        remove_method :zero?
+        def zero?
+          self == 0
+        end
+      end
+
+      3.times do
+        p 0.zero?
+      end
+    end;
+  end
+
   def test_block_handler_with_possible_frame_omitted_inlining
     assert_eval_with_jit("#{<<~"begin;"}\n#{<<~"end;"}", stdout: "70.0\n70.0\n70.0\n", success_count: 2, min_calls: 2)
     begin;
@@ -870,6 +1053,10 @@ class TestJIT < Test::Unit::TestCase
         p multiply(7.0, 10.0)
       end
     end;
+  end
+
+  def test_builtin_frame_omitted_inlining
+    assert_eval_with_jit('0.zero?; 0.zero?; 3.times { p 0.zero? }', stdout: "true\ntrue\ntrue\n", success_count: 1, min_calls: 2)
   end
 
   def test_program_counter_with_regexpmatch
@@ -929,7 +1116,7 @@ class TestJIT < Test::Unit::TestCase
 
         before_fork; before_fork # the child should not delete this .o file
         pid = Process.fork do # this child should not delete shared .pch file
-          sleep 0.5 # to prevent mixing outputs on Solaris
+          sleep 2.0 # to prevent mixing outputs on Solaris
           after_fork; after_fork # this child does not share JIT-ed after_fork with parent
         end
         after_fork; after_fork # this parent does not share JIT-ed after_fork with child
@@ -961,41 +1148,52 @@ class TestJIT < Test::Unit::TestCase
   end
 
   # Shorthand for normal test cases
-  def assert_eval_with_jit(script, stdout: nil, success_count:, min_calls: 1, insns: [], uplevel: 1)
-    out, err = eval_with_jit(script, verbose: 1, min_calls: min_calls)
-    actual = err.scan(/^#{JIT_SUCCESS_PREFIX}:/).size
+  def assert_eval_with_jit(script, stdout: nil, success_count:, recompile_count: nil, min_calls: 1, max_cache: 1000, insns: [], uplevel: 1, ignorable_patterns: [])
+    out, err = eval_with_jit(script, verbose: 1, min_calls: min_calls, max_cache: max_cache)
+    success_actual = err.scan(/^#{JIT_SUCCESS_PREFIX}:/).size
+    recompile_actual = err.scan(/^#{JIT_RECOMPILE_PREFIX}:/).size
     # Add --jit-verbose=2 logs for cl.exe because compiler's error message is suppressed
     # for cl.exe with --jit-verbose=1. See `start_process` in mjit_worker.c.
-    if RUBY_PLATFORM.match?(/mswin/) && success_count != actual
-      out2, err2 = eval_with_jit(script, verbose: 2, min_calls: min_calls)
+    if RUBY_PLATFORM.match?(/mswin/) && success_count != success_actual
+      out2, err2 = eval_with_jit(script, verbose: 2, min_calls: min_calls, max_cache: max_cache)
     end
 
     # Make sure that the script has insns expected to be tested
     used_insns = method_insns(script)
     insns.each do |insn|
-      unless used_insns.include?(insn)
-        $stderr.puts
-        warn "'#{insn}' insn is not included in the script. Actual insns are: #{used_insns.join(' ')}\n", uplevel: uplevel+2
-      end
-      TestJIT.untested_insns.delete(insn)
+      mark_tested_insn(insn, used_insns: used_insns, uplevel: uplevel + 3)
     end
 
+    suffix = "script:\n#{code_block(script)}\nstderr:\n#{code_block(err)}#{(
+      "\nstdout(verbose=2 retry):\n#{code_block(out2)}\nstderr(verbose=2 retry):\n#{code_block(err2)}" if out2 || err2
+    )}"
     assert_equal(
-      success_count, actual,
-      "Expected #{success_count} times of JIT success, but succeeded #{actual} times.\n\n"\
-      "script:\n#{code_block(script)}\nstderr:\n#{code_block(err)}#{(
-        "\nstdout(verbose=2 retry):\n#{code_block(out2)}\nstderr(verbose=2 retry):\n#{code_block(err2)}" if out2 || err2
-      )}",
+      success_count, success_actual,
+      "Expected #{success_count} times of JIT success, but succeeded #{success_actual} times.\n\n#{suffix}",
     )
+    if recompile_count
+      assert_equal(
+        recompile_count, recompile_actual,
+        "Expected #{success_count} times of JIT recompile, but recompiled #{success_actual} times.\n\n#{suffix}",
+      )
+    end
     if stdout
       assert_equal(stdout, out, "Expected stdout #{out.inspect} to match #{stdout.inspect} with script:\n#{code_block(script)}")
     end
     err_lines = err.lines.reject! do |l|
-      l.chomp.empty? || l.match?(/\A#{JIT_SUCCESS_PREFIX}/) || IGNORABLE_PATTERNS.any? { |pat| pat.match?(l) }
+      l.chomp.empty? || l.match?(/\A#{JIT_SUCCESS_PREFIX}/) || (IGNORABLE_PATTERNS + ignorable_patterns).any? { |pat| pat.match?(l) }
     end
     unless err_lines.empty?
       warn err_lines.join(''), uplevel: uplevel
     end
+  end
+
+  def mark_tested_insn(insn, used_insns:, uplevel: 1)
+    unless used_insns.include?(insn)
+      $stderr.puts
+      warn "'#{insn}' insn is not included in the script. Actual insns are: #{used_insns.join(' ')}\n", uplevel: uplevel
+    end
+    TestJIT.untested_insns.delete(insn)
   end
 
   # Collect block's insns or defined method's insns, which are expected to be JIT-ed.

@@ -11,14 +11,22 @@
 
 **********************************************************************/
 
+#include "ruby/internal/config.h"
+
 #ifdef _WIN32
-#include "missing/file.h"
+# include "missing/file.h"
+# include "ruby.h"
 #endif
+
+#include <ctype.h>
+#include <time.h>
+
 #ifdef __CYGWIN__
-#include <windows.h>
-#include <sys/cygwin.h>
-#include <wchar.h>
+# include <windows.h>
+# include <sys/cygwin.h>
+# include <wchar.h>
 #endif
+
 #ifdef __APPLE__
 # if !(defined(__has_feature) && defined(__has_attribute))
 /* Maybe a bug in SDK of Xcode 10.2.1 */
@@ -28,21 +36,13 @@
 #   define API_AVAILABLE(...)
 #   define API_DEPRECATED(...)
 # endif
-#include <CoreFoundation/CFString.h>
+# include <CoreFoundation/CFString.h>
 #endif
-
-#include "id.h"
-#include "ruby/encoding.h"
-#include "ruby/io.h"
-#include "ruby/util.h"
-#include "ruby/thread.h"
-#include "internal.h"
-#include "dln.h"
-#include "encindex.h"
 
 #ifdef HAVE_UNISTD_H
-#include <unistd.h>
+# include <unistd.h>
 #endif
+
 #ifdef HAVE_SYS_TIME_H
 # include <sys/time.h>
 #endif
@@ -60,77 +60,73 @@ int flock(int, int);
 # define MAXPATHLEN 1024
 #endif
 
-#include <ctype.h>
-
-#include <time.h>
-
 #ifdef HAVE_UTIME_H
-#include <utime.h>
+# include <utime.h>
 #elif defined HAVE_SYS_UTIME_H
-#include <sys/utime.h>
+# include <sys/utime.h>
 #endif
 
 #ifdef HAVE_PWD_H
-#include <pwd.h>
+# include <pwd.h>
 #endif
 
 #ifdef HAVE_SYS_SYSMACROS_H
-#include <sys/sysmacros.h>
+# include <sys/sysmacros.h>
 #endif
 
 #include <sys/types.h>
 #include <sys/stat.h>
 
 #ifdef HAVE_SYS_MKDEV_H
-#include <sys/mkdev.h>
+# include <sys/mkdev.h>
 #endif
 
 #if defined(HAVE_FCNTL_H)
-#include <fcntl.h>
+# include <fcntl.h>
 #endif
 
 #if defined(HAVE_SYS_TIME_H)
-#include <sys/time.h>
+# include <sys/time.h>
 #endif
 
 #if !defined HAVE_LSTAT && !defined lstat
-#define lstat stat
+# define lstat stat
 #endif
 
 /* define system APIs */
 #ifdef _WIN32
-#include "win32/file.h"
-#define STAT(p, s)	rb_w32_ustati128((p), (s))
-#undef lstat
-#define lstat(p, s)	rb_w32_ulstati128((p), (s))
-#undef access
-#define access(p, m)	rb_w32_uaccess((p), (m))
-#undef truncate
-#define truncate(p, n)	rb_w32_utruncate((p), (n))
-#undef chmod
-#define chmod(p, m)	rb_w32_uchmod((p), (m))
-#undef chown
-#define chown(p, o, g)	rb_w32_uchown((p), (o), (g))
-#undef lchown
-#define lchown(p, o, g)	rb_w32_ulchown((p), (o), (g))
-#undef utimensat
-#define utimensat(s, p, t, f)	rb_w32_uutimensat((s), (p), (t), (f))
-#undef link
-#define link(f, t)	rb_w32_ulink((f), (t))
-#undef unlink
-#define unlink(p)	rb_w32_uunlink(p)
-#undef rename
-#define rename(f, t)	rb_w32_urename((f), (t))
-#undef symlink
-#define symlink(s, l)	rb_w32_usymlink((s), (l))
+# include "win32/file.h"
+# define STAT(p, s)      rb_w32_ustati128((p), (s))
+# undef lstat
+# define lstat(p, s)     rb_w32_ulstati128((p), (s))
+# undef access
+# define access(p, m)    rb_w32_uaccess((p), (m))
+# undef truncate
+# define truncate(p, n)  rb_w32_utruncate((p), (n))
+# undef chmod
+# define chmod(p, m)     rb_w32_uchmod((p), (m))
+# undef chown
+# define chown(p, o, g)  rb_w32_uchown((p), (o), (g))
+# undef lchown
+# define lchown(p, o, g) rb_w32_ulchown((p), (o), (g))
+# undef utimensat
+# define utimensat(s, p, t, f)   rb_w32_uutimensat((s), (p), (t), (f))
+# undef link
+# define link(f, t)      rb_w32_ulink((f), (t))
+# undef unlink
+# define unlink(p)       rb_w32_uunlink(p)
+# undef rename
+# define rename(f, t)    rb_w32_urename((f), (t))
+# undef symlink
+# define symlink(s, l)   rb_w32_usymlink((s), (l))
 
-#ifdef HAVE_REALPATH
+# ifdef HAVE_REALPATH
 /* Don't use native realpath(3) on Windows, as the check for
    absolute paths does not work for drive letters. */
-#undef HAVE_REALPATH
-#endif
+#  undef HAVE_REALPATH
+# endif
 #else
-#define STAT(p, s)	stat((p), (s))
+# define STAT(p, s)      stat((p), (s))
 #endif
 
 #if defined _WIN32 || defined __APPLE__
@@ -143,7 +139,7 @@ int flock(int, int);
 
 /* utime may fail if time is out-of-range for the FS [ruby-dev:38277] */
 #if defined DOSISH || defined __CYGWIN__
-#  define UTIME_EINVAL
+# define UTIME_EINVAL
 #endif
 
 /* Solaris 10 realpath(3) doesn't support File.realpath */
@@ -152,15 +148,32 @@ int flock(int, int);
 #endif
 
 #ifdef HAVE_REALPATH
-#include <limits.h>
-#include <stdlib.h>
+# include <limits.h>
+# include <stdlib.h>
 #endif
+
+#include "dln.h"
+#include "encindex.h"
+#include "id.h"
+#include "internal.h"
+#include "internal/compilers.h"
+#include "internal/dir.h"
+#include "internal/error.h"
+#include "internal/file.h"
+#include "internal/io.h"
+#include "internal/load.h"
+#include "internal/object.h"
+#include "internal/process.h"
+#include "internal/thread.h"
+#include "internal/vm.h"
+#include "ruby/encoding.h"
+#include "ruby/io.h"
+#include "ruby/thread.h"
+#include "ruby/util.h"
 
 VALUE rb_cFile;
 VALUE rb_mFileTest;
 VALUE rb_cStat;
-
-#define insecure_obj_p(obj, level) ((level) > 0 && OBJ_TAINTED(obj))
 
 static VALUE
 file_path_convert(VALUE name)
@@ -195,14 +208,10 @@ check_path_encoding(VALUE str)
 }
 
 VALUE
-rb_get_path_check_to_string(VALUE obj, int level)
+rb_get_path_check_to_string(VALUE obj)
 {
     VALUE tmp;
     ID to_path;
-
-    if (insecure_obj_p(obj, level)) {
-	rb_insecure_operation();
-    }
 
     if (RB_TYPE_P(obj, T_STRING)) {
 	return obj;
@@ -214,38 +223,28 @@ rb_get_path_check_to_string(VALUE obj, int level)
 }
 
 VALUE
-rb_get_path_check_convert(VALUE obj, VALUE tmp, int level)
+rb_get_path_check_convert(VALUE obj)
 {
-    tmp = file_path_convert(tmp);
-    if (obj != tmp && insecure_obj_p(tmp, level)) {
-	rb_insecure_operation();
-    }
+    obj = file_path_convert(obj);
 
-    check_path_encoding(tmp);
-    if (!rb_str_to_cstr(tmp)) {
+    check_path_encoding(obj);
+    if (!rb_str_to_cstr(obj)) {
 	rb_raise(rb_eArgError, "path name contains null byte");
     }
 
-    return rb_str_new4(tmp);
-}
-
-VALUE
-rb_get_path_check(VALUE obj, int level)
-{
-    VALUE tmp = rb_get_path_check_to_string(obj, level);
-    return rb_get_path_check_convert(obj, tmp, level);
+    return rb_str_new4(obj);
 }
 
 VALUE
 rb_get_path_no_checksafe(VALUE obj)
 {
-    return rb_get_path_check(obj, 0);
+    return rb_get_path(obj);
 }
 
 VALUE
 rb_get_path(VALUE obj)
 {
-    return rb_get_path_check(obj, rb_safe_level());
+    return rb_get_path_check_convert(rb_get_path_check_to_string(obj));
 }
 
 VALUE
@@ -253,12 +252,12 @@ rb_str_encode_ospath(VALUE path)
 {
 #if USE_OSPATH
     int encidx = ENCODING_GET(path);
-#ifdef _WIN32
+#if 0 && defined _WIN32
     if (encidx == ENCINDEX_ASCII) {
 	encidx = rb_filesystem_encindex();
     }
 #endif
-    if (encidx != ENCINDEX_UTF_8) {
+    if (encidx != ENCINDEX_ASCII && encidx != ENCINDEX_UTF_8) {
 	rb_encoding *enc = rb_enc_from_index(encidx);
 	rb_encoding *utf8 = rb_utf8_encoding();
 	path = rb_str_conv_enc(path, enc, utf8);
@@ -683,7 +682,21 @@ rb_stat_mode(VALUE self)
 static VALUE
 rb_stat_nlink(VALUE self)
 {
-    return UINT2NUM(get_stat(self)->st_nlink);
+    /* struct stat::st_nlink is nlink_t in POSIX.  Not the case for Windows. */
+    const struct stat *ptr = get_stat(self);
+
+    if (sizeof(ptr->st_nlink) <= sizeof(int)) {
+        return UINT2NUM((unsigned)ptr->st_nlink);
+    }
+    else if (sizeof(ptr->st_nlink) == sizeof(long)) {
+        return ULONG2NUM((unsigned long)ptr->st_nlink);
+    }
+    else if (sizeof(ptr->st_nlink) == sizeof(LONG_LONG)) {
+        return ULL2NUM((unsigned LONG_LONG)ptr->st_nlink);
+    }
+    else {
+        rb_bug(":FIXME: don't know what to do");
+    }
 }
 
 /*
@@ -1088,7 +1101,6 @@ rb_stat_inspect(VALUE self)
 	}
     }
     rb_str_buf_cat2(str, ">");
-    OBJ_INFECT(str, self);
 
     return str;
 }
@@ -1775,25 +1787,20 @@ rb_file_exist_p(VALUE obj, VALUE fname)
     return Qtrue;
 }
 
-/*
- * call-seq:
- *    File.exists?(file_name)   ->  true or false
- *
- * Deprecated method. Don't use.
- */
+/* :nodoc: */
 static VALUE
 rb_file_exists_p(VALUE obj, VALUE fname)
 {
-    const char *s = "FileTest#";
+    const char *s = "FileTest#exist?";
     if (obj == rb_mFileTest) {
-	s = "FileTest.";
+	s = "FileTest.exist?";
     }
     else if (obj == rb_cFile ||
 	     (RB_TYPE_P(obj, T_CLASS) &&
 	      RTEST(rb_class_inherited_p(obj, rb_cFile)))) {
-	s = "File.";
+	s = "File.exist?";
     }
-    rb_warning("%sexists? is a deprecated name, use %sexist? instead", s, s);
+    rb_warn_deprecated("%.*ss?", s, (int)(strlen(s)-1), s);
     return rb_file_exist_p(obj, fname);
 }
 
@@ -1803,6 +1810,9 @@ rb_file_exists_p(VALUE obj, VALUE fname)
  *
  * Returns <code>true</code> if the named file is readable by the effective
  * user and group id of this process. See eaccess(3).
+ *
+ * Note that some OS-level security features may cause this to return true
+ * even though the file is not readable by the effective user/group.
  */
 
 static VALUE
@@ -1818,6 +1828,9 @@ rb_file_readable_p(VALUE obj, VALUE fname)
  *
  * Returns <code>true</code> if the named file is readable by the real
  * user and group id of this process. See access(3).
+ *
+ * Note that some OS-level security features may cause this to return true
+ * even though the file is not readable by the real user/group.
  */
 
 static VALUE
@@ -1871,6 +1884,9 @@ rb_file_world_readable_p(VALUE obj, VALUE fname)
  *
  * Returns <code>true</code> if the named file is writable by the effective
  * user and group id of this process. See eaccess(3).
+ *
+ * Note that some OS-level security features may cause this to return true
+ * even though the file is not writable by the effective user/group.
  */
 
 static VALUE
@@ -1885,7 +1901,10 @@ rb_file_writable_p(VALUE obj, VALUE fname)
  *    File.writable_real?(file_name)   -> true or false
  *
  * Returns <code>true</code> if the named file is writable by the real
- * user and group id of this process. See access(3)
+ * user and group id of this process. See access(3).
+ *
+ * Note that some OS-level security features may cause this to return true
+ * even though the file is not writable by the real user/group.
  */
 
 static VALUE
@@ -1935,6 +1954,9 @@ rb_file_world_writable_p(VALUE obj, VALUE fname)
  * Windows does not support execute permissions separately from read
  * permissions. On Windows, a file is only considered executable if it ends in
  * .bat, .cmd, .com, or .exe.
+ *
+ * Note that some OS-level security features may cause this to return true
+ * even though the file is not executable by the effective user/group.
  */
 
 static VALUE
@@ -1954,6 +1976,9 @@ rb_file_executable_p(VALUE obj, VALUE fname)
  * Windows does not support execute permissions separately from read
  * permissions. On Windows, a file is only considered executable if it ends in
  * .bat, .cmd, .com, or .exe.
+ *
+ * Note that some OS-level security features may cause this to return true
+ * even though the file is not executable by the real user/group.
  */
 
 static VALUE
@@ -2538,7 +2563,7 @@ chmod_internal(const char *path, void *mode)
  */
 
 static VALUE
-rb_file_s_chmod(int argc, VALUE *argv)
+rb_file_s_chmod(int argc, VALUE *argv, VALUE _)
 {
     mode_t mode;
 
@@ -2610,7 +2635,7 @@ lchmod_internal(const char *path, void *mode)
  */
 
 static VALUE
-rb_file_s_lchmod(int argc, VALUE *argv)
+rb_file_s_lchmod(int argc, VALUE *argv, VALUE _)
 {
     mode_t mode;
 
@@ -2669,7 +2694,7 @@ chown_internal(const char *path, void *arg)
  */
 
 static VALUE
-rb_file_s_chown(int argc, VALUE *argv)
+rb_file_s_chown(int argc, VALUE *argv, VALUE _)
 {
     struct chown_args arg;
 
@@ -2741,7 +2766,7 @@ lchown_internal(const char *path, void *arg)
  */
 
 static VALUE
-rb_file_s_lchown(int argc, VALUE *argv)
+rb_file_s_lchown(int argc, VALUE *argv, VALUE _)
 {
     struct chown_args arg;
 
@@ -2919,7 +2944,7 @@ utime_internal_i(int argc, VALUE *argv, int follow)
  */
 
 static VALUE
-rb_file_s_utime(int argc, VALUE *argv)
+rb_file_s_utime(int argc, VALUE *argv, VALUE _)
 {
     return utime_internal_i(argc, argv, FALSE);
 }
@@ -2938,7 +2963,7 @@ rb_file_s_utime(int argc, VALUE *argv)
  */
 
 static VALUE
-rb_file_s_lutime(int argc, VALUE *argv)
+rb_file_s_lutime(int argc, VALUE *argv, VALUE _)
 {
     return utime_internal_i(argc, argv, TRUE);
 }
@@ -3217,7 +3242,7 @@ rb_file_s_rename(VALUE klass, VALUE from, VALUE to)
  */
 
 static VALUE
-rb_file_s_umask(int argc, VALUE *argv)
+rb_file_s_umask(int argc, VALUE *argv, VALUE _)
 {
     mode_t omask = 0;
 
@@ -3578,21 +3603,42 @@ rb_default_home_dir(VALUE result)
 
 #if defined HAVE_PWD_H
     if (!dir) {
-	const char *login = getlogin();
-	if (login) {
-	    struct passwd *pw = getpwnam(login);
-	    if (pw) {
-		copy_home_path(result, pw->pw_dir);
-		endpwent();
-		return result;
-	    }
-	    endpwent();
-	    rb_raise(rb_eArgError, "couldn't find HOME for login `%s' -- expanding `~'",
-		     login);
-	}
-	else {
-	    rb_raise(rb_eArgError, "couldn't find login name -- expanding `~'");
-	}
+        /* We'll look up the user's default home dir in the password db by
+         * login name, if possible, and failing that will fall back to looking
+         * the information up by uid (as would be needed for processes that
+         * are not a descendant of login(1) or a work-alike).
+         *
+         * While the lookup by uid is more likely to succeed (since we always
+         * have a uid, but may or may not have a login name), we prefer first
+         * looking up by name to accommodate the possibility of multiple login
+         * names (each with its own record in the password database, so each
+         * with a potentially different home directory) being mapped to the
+         * same uid (as explicitly allowed for by POSIX; see getlogin(3posix)).
+         */
+        VALUE login_name = rb_getlogin();
+
+# if !defined(HAVE_GETPWUID_R) && !defined(HAVE_GETPWUID)
+        /* This is a corner case, but for backward compatibility reasons we
+         * want to emit this error if neither the lookup by login name nor
+         * lookup by getuid() has a chance of succeeding.
+         */
+        if (NIL_P(login_name)) {
+            rb_raise(rb_eArgError, "couldn't find login name -- expanding `~'");
+        }
+# endif
+
+        VALUE pw_dir = rb_getpwdirnam_for_login(login_name);
+        if (NIL_P(pw_dir)) {
+            pw_dir = rb_getpwdiruid();
+            if (NIL_P(pw_dir)) {
+                rb_raise(rb_eArgError, "couldn't find home for uid `%ld'", (long)getuid());
+            }
+        }
+
+        /* found it */
+        copy_home_path(result, RSTRING_PTR(pw_dir));
+        rb_str_resize(pw_dir, 0);
+        return result;
     }
 #endif
     if (!dir) {
@@ -3647,18 +3693,15 @@ rb_file_expand_path_internal(VALUE fname, VALUE dname, int abs_mode, int long_na
     const char *s, *b, *fend;
     char *buf, *p, *pend, *root;
     size_t buflen, bdiff;
-    int tainted;
     rb_encoding *enc, *fsenc = rb_filesystem_encoding();
 
     s = StringValuePtr(fname);
     fend = s + RSTRING_LEN(fname);
     enc = rb_enc_get(fname);
     BUFINIT();
-    tainted = OBJ_TAINTED(fname);
 
     if (s[0] == '~' && abs_mode == 0) {      /* execute only if NOT absolute_path() */
 	long userlen = 0;
-	tainted = 1;
 	if (isdirsep(s[1]) || s[1] == '\0') {
 	    buf = 0;
 	    b = 0;
@@ -3716,7 +3759,6 @@ rb_file_expand_path_internal(VALUE fname, VALUE dname, int abs_mode, int long_na
 	    }
 	    if (!same) {
 		char *e = append_fspath(result, fname, getcwdofdrv(*s), &enc, fsenc);
-		tainted = 1;
 		BUFINIT();
 		p = e;
 	    }
@@ -3738,7 +3780,6 @@ rb_file_expand_path_internal(VALUE fname, VALUE dname, int abs_mode, int long_na
 	}
 	else {
 	    char *e = append_fspath(result, fname, ruby_getcwd(), &enc, fsenc);
-	    tainted = 1;
 	    BUFINIT();
 	    p = e;
 	}
@@ -3989,7 +4030,6 @@ rb_file_expand_path_internal(VALUE fname, VALUE dname, int abs_mode, int long_na
     }
 #endif
 
-    if (tainted) OBJ_TAINT(result);
     rb_str_set_len(result, p - buf);
     rb_enc_check(fname, result);
     ENC_CODERANGE_CLEAR(result);
@@ -4032,6 +4072,13 @@ rb_file_expand_path_fast(VALUE fname, VALUE dname)
     return expand_path(fname, dname, 0, 0, EXPAND_PATH_BUFFER());
 }
 
+VALUE
+rb_file_s_expand_path(int argc, const VALUE *argv)
+{
+    rb_check_arity(argc, 1, 2);
+    return rb_file_expand_path(argv[0], argc > 1 ? argv[1] : Qnil);
+}
+
 /*
  *  call-seq:
  *     File.expand_path(file_name [, dir_string] )  ->  abs_file_name
@@ -4060,11 +4107,10 @@ rb_file_expand_path_fast(VALUE fname, VALUE dname)
  *  parent, the root of the project and appends +lib/mygem.rb+.
  */
 
-VALUE
-rb_file_s_expand_path(int argc, const VALUE *argv)
+static VALUE
+s_expand_path(int c, const VALUE * v, VALUE _)
 {
-    rb_check_arity(argc, 1, 2);
-    return rb_file_expand_path(argv[0], argc > 1 ? argv[1] : Qnil);
+    return rb_file_s_expand_path(c, v);
 }
 
 VALUE
@@ -4072,6 +4118,13 @@ rb_file_absolute_path(VALUE fname, VALUE dname)
 {
     check_expand_path_args(fname, dname);
     return expand_path(fname, dname, 1, 1, EXPAND_PATH_BUFFER());
+}
+
+VALUE
+rb_file_s_absolute_path(int argc, const VALUE *argv)
+{
+    rb_check_arity(argc, 1, 2);
+    return rb_file_absolute_path(argv[0], argc > 1 ? argv[1] : Qnil);
 }
 
 /*
@@ -4087,11 +4140,29 @@ rb_file_absolute_path(VALUE fname, VALUE dname)
  *     File.absolute_path("~oracle/bin")       #=> "<relative_path>/~oracle/bin"
  */
 
-VALUE
-rb_file_s_absolute_path(int argc, const VALUE *argv)
+static VALUE
+s_absolute_path(int c, const VALUE * v, VALUE _)
 {
-    rb_check_arity(argc, 1, 2);
-    return rb_file_absolute_path(argv[0], argc > 1 ? argv[1] : Qnil);
+    return rb_file_s_absolute_path(c, v);
+}
+
+/*
+ *  call-seq:
+ *     File.absolute_path?(file_name)  ->  true or false
+ *
+ *  Returns <code>true</code> if +file_name+ is an absolute path, and
+ *  <code>false</code> otherwise.
+ *
+ *     File.absolute_path?("c:/foo")     #=> false (on Linux), true (on Windows)
+ */
+
+static VALUE
+s_absolute_path_p(VALUE klass, VALUE fname)
+{
+    VALUE path = rb_get_path(fname);
+
+    if (!rb_is_absolute_path(RSTRING_PTR(path))) return Qfalse;
+    return Qtrue;
 }
 
 enum rb_realpath_mode {
@@ -4217,7 +4288,7 @@ realpath_rec(long *prefixlenp, VALUE *resolvedp, const char *unresolved, VALUE f
 }
 
 static VALUE
-rb_check_realpath_emulate(VALUE basedir, VALUE path, enum rb_realpath_mode mode)
+rb_check_realpath_emulate(VALUE basedir, VALUE path, rb_encoding *origenc, enum rb_realpath_mode mode)
 {
     long prefixlen;
     VALUE resolved;
@@ -4225,7 +4296,7 @@ rb_check_realpath_emulate(VALUE basedir, VALUE path, enum rb_realpath_mode mode)
     VALUE loopcheck;
     VALUE curdir = Qnil;
 
-    rb_encoding *enc, *origenc;
+    rb_encoding *enc;
     char *path_names = NULL, *basedir_names = NULL, *curdir_names = NULL;
     char *ptr, *prefixptr = NULL, *pend;
     long len;
@@ -4238,7 +4309,6 @@ rb_check_realpath_emulate(VALUE basedir, VALUE path, enum rb_realpath_mode mode)
     }
 
     enc = rb_enc_get(unresolved_path);
-    origenc = enc;
     unresolved_path = TO_OSPATH(unresolved_path);
     RSTRING_GETMEM(unresolved_path, ptr, len);
     path_names = skipprefixroot(ptr, ptr + len, rb_enc_get(unresolved_path));
@@ -4296,7 +4366,7 @@ rb_check_realpath_emulate(VALUE basedir, VALUE path, enum rb_realpath_mode mode)
     if (realpath_rec(&prefixlen, &resolved, path_names, Qnil, loopcheck, mode, 1))
 	return Qnil;
 
-    if (origenc != rb_enc_get(resolved)) {
+    if (origenc && origenc != rb_enc_get(resolved)) {
 	if (rb_enc_str_asciionly_p(resolved)) {
 	    rb_enc_associate(resolved, origenc);
 	}
@@ -4305,7 +4375,6 @@ rb_check_realpath_emulate(VALUE basedir, VALUE path, enum rb_realpath_mode mode)
 	}
     }
 
-    rb_obj_taint(resolved);
     RB_GC_GUARD(unresolved_path);
     RB_GC_GUARD(curdir);
     return resolved;
@@ -4314,27 +4383,24 @@ rb_check_realpath_emulate(VALUE basedir, VALUE path, enum rb_realpath_mode mode)
 static VALUE rb_file_join(VALUE ary);
 
 static VALUE
-rb_check_realpath_internal(VALUE basedir, VALUE path, enum rb_realpath_mode mode)
+rb_check_realpath_internal(VALUE basedir, VALUE path, rb_encoding *origenc, enum rb_realpath_mode mode)
 {
 #ifdef HAVE_REALPATH
     VALUE unresolved_path;
-    rb_encoding *origenc;
     char *resolved_ptr = NULL;
     VALUE resolved;
-    struct stat st;
 
     if (mode == RB_REALPATH_DIR) {
-        return rb_check_realpath_emulate(basedir, path, mode);
+        return rb_check_realpath_emulate(basedir, path, origenc, mode);
     }
 
     unresolved_path = rb_str_dup_frozen(path);
-    origenc = rb_enc_get(unresolved_path);
     if (*RSTRING_PTR(unresolved_path) != '/' && !NIL_P(basedir)) {
         unresolved_path = rb_file_join(rb_assoc_new(basedir, unresolved_path));
     }
-    unresolved_path = TO_OSPATH(unresolved_path);
+    if (origenc) unresolved_path = TO_OSPATH(unresolved_path);
 
-    if((resolved_ptr = realpath(RSTRING_PTR(unresolved_path), NULL)) == NULL) {
+    if ((resolved_ptr = realpath(RSTRING_PTR(unresolved_path), NULL)) == NULL) {
         /* glibc realpath(3) does not allow /path/to/file.rb/../other_file.rb,
            returning ENOTDIR in that case.
            glibc realpath(3) can also return ENOENT for paths that exist,
@@ -4342,7 +4408,7 @@ rb_check_realpath_internal(VALUE basedir, VALUE path, enum rb_realpath_mode mode
            Fallback to the emulated approach in either of those cases. */
         if (errno == ENOTDIR ||
             (errno == ENOENT && rb_file_exist_p(0, unresolved_path))) {
-            return rb_check_realpath_emulate(basedir, path, mode);
+            return rb_check_realpath_emulate(basedir, path, origenc, mode);
 
         }
         if (mode == RB_REALPATH_CHECK) {
@@ -4353,32 +4419,36 @@ rb_check_realpath_internal(VALUE basedir, VALUE path, enum rb_realpath_mode mode
     resolved = ospath_new(resolved_ptr, strlen(resolved_ptr), rb_filesystem_encoding());
     free(resolved_ptr);
 
-    if (rb_stat(resolved, &st) < 0) {
+# if !defined(__LINUX__) && !defined(__APPLE__)
+    /* As `resolved` is a String in the filesystem encoding, no
+     * conversion is needed */
+    struct stat st;
+    if (stat_without_gvl(RSTRING_PTR(resolved), &st) < 0) {
         if (mode == RB_REALPATH_CHECK) {
             return Qnil;
         }
         rb_sys_fail_path(unresolved_path);
     }
+# endif
 
-    if (origenc != rb_enc_get(resolved)) {
+    if (origenc && origenc != rb_enc_get(resolved)) {
         if (!rb_enc_str_asciionly_p(resolved)) {
             resolved = rb_str_conv_enc(resolved, NULL, origenc);
         }
         rb_enc_associate(resolved, origenc);
     }
 
-    if(rb_enc_str_coderange(resolved) == ENC_CODERANGE_BROKEN) {
+    if (rb_enc_str_coderange(resolved) == ENC_CODERANGE_BROKEN) {
         rb_enc_associate(resolved, rb_filesystem_encoding());
-        if(rb_enc_str_coderange(resolved) == ENC_CODERANGE_BROKEN) {
+        if (rb_enc_str_coderange(resolved) == ENC_CODERANGE_BROKEN) {
             rb_enc_associate(resolved, rb_ascii8bit_encoding());
         }
     }
 
-    rb_obj_taint(resolved);
     RB_GC_GUARD(unresolved_path);
     return resolved;
 #else
-    return rb_check_realpath_emulate(basedir, path, mode);
+    return rb_check_realpath_emulate(basedir, path, origenc, mode);
 #endif /* HAVE_REALPATH */
 }
 
@@ -4387,13 +4457,13 @@ rb_realpath_internal(VALUE basedir, VALUE path, int strict)
 {
     const enum rb_realpath_mode mode =
 	strict ? RB_REALPATH_STRICT : RB_REALPATH_DIR;
-    return rb_check_realpath_internal(basedir, path, mode);
+    return rb_check_realpath_internal(basedir, path, rb_enc_get(path), mode);
 }
 
 VALUE
-rb_check_realpath(VALUE basedir, VALUE path)
+rb_check_realpath(VALUE basedir, VALUE path, rb_encoding *enc)
 {
-    return rb_check_realpath_internal(basedir, path, RB_REALPATH_CHECK);
+    return rb_check_realpath_internal(basedir, path, enc, RB_REALPATH_CHECK);
 }
 
 /*
@@ -4556,7 +4626,7 @@ ruby_enc_find_basename(const char *name, long *baselen, long *alllen, rb_encodin
  */
 
 static VALUE
-rb_file_s_basename(int argc, VALUE *argv)
+rb_file_s_basename(int argc, VALUE *argv, VALUE _)
 {
     VALUE fname, fext, basename;
     const char *name, *p;
@@ -4596,7 +4666,6 @@ rb_file_s_basename(int argc, VALUE *argv)
 
     basename = rb_str_new(p, f);
     rb_enc_copy(basename, fname);
-    OBJ_INFECT(basename, fname);
     return basename;
 }
 
@@ -4658,7 +4727,6 @@ rb_file_dirname(VALUE fname)
 	rb_str_cat(dirname, ".", 1);
 #endif
     rb_enc_copy(dirname, fname);
-    OBJ_INFECT(dirname, fname);
     return dirname;
 }
 
@@ -4740,10 +4808,13 @@ ruby_enc_find_extname(const char *name, long *len, rb_encoding *enc)
  *  An empty string will also be returned when the period is the last character
  *  in +path+.
  *
+ *  On Windows, trailing dots are truncated.
+ *
  *     File.extname("test.rb")         #=> ".rb"
  *     File.extname("a/b/d/test.rb")   #=> ".rb"
  *     File.extname(".a/b/d/test.rb")  #=> ".rb"
- *     File.extname("foo.")            #=> ""
+ *     File.extname("foo.")            #=> "" on Windows
+ *     File.extname("foo.")            #=> "." on non-Windows
  *     File.extname("test")            #=> ""
  *     File.extname(".profile")        #=> ""
  *     File.extname(".profile.sh")     #=> ".sh"
@@ -4761,10 +4832,9 @@ rb_file_s_extname(VALUE klass, VALUE fname)
     name = StringValueCStr(fname);
     len = RSTRING_LEN(fname);
     e = ruby_enc_find_extname(name, &len, rb_enc_get(fname));
-    if (len <= 1)
+    if (len < 1)
 	return rb_str_new(0, 0);
     extname = rb_str_subseq(fname, e - name, len); /* keep the dot, too! */
-    OBJ_INFECT(extname, fname);
     return extname;
 }
 
@@ -4800,7 +4870,7 @@ static VALUE
 rb_file_s_split(VALUE klass, VALUE path)
 {
     FilePathStringValue(path);		/* get rid of converting twice */
-    return rb_assoc_new(rb_file_dirname(path), rb_file_s_basename(1,&path));
+    return rb_assoc_new(rb_file_dirname(path), rb_file_s_basename(1,&path,Qundef));
 }
 
 static VALUE
@@ -4835,7 +4905,6 @@ rb_file_join(VALUE ary)
     len += RARRAY_LEN(ary) - 1;
     result = rb_str_buf_new(len);
     RBASIC_CLEAR_CLASS(result);
-    OBJ_INFECT(result, ary);
     for (i=0; i<RARRAY_LEN(ary); i++) {
 	tmp = RARRAY_AREF(ary, i);
 	switch (OBJ_BUILTIN_TYPE(tmp)) {
@@ -5225,21 +5294,14 @@ test_check(int n, int argc, VALUE *argv)
  */
 
 static VALUE
-rb_f_test(int argc, VALUE *argv)
+rb_f_test(int argc, VALUE *argv, VALUE _)
 {
     int cmd;
 
     if (argc == 0) rb_check_arity(argc, 2, 3);
     cmd = NUM2CHR(argv[0]);
     if (cmd == 0) {
-      unknown:
-	/* unknown command */
-	if (ISPRINT(cmd)) {
-	    rb_raise(rb_eArgError, "unknown command '%s%c'", cmd == '\'' || cmd == '\\' ? "\\" : "", cmd);
-	}
-	else {
-	    rb_raise(rb_eArgError, "unknown command \"\\x%02X\"", cmd);
-	}
+        goto unknown;
     }
     if (strchr("bcdefgGkloOprRsSuwWxXz", cmd)) {
 	CHECK(1);
@@ -5365,7 +5427,15 @@ rb_f_test(int argc, VALUE *argv)
 	    return Qfalse;
 	}
     }
-    goto unknown;
+  unknown:
+    /* unknown command */
+    if (ISPRINT(cmd)) {
+        rb_raise(rb_eArgError, "unknown command '%s%c'", cmd == '\'' || cmd == '\\' ? "\\" : "", cmd);
+    }
+    else {
+        rb_raise(rb_eArgError, "unknown command \"\\x%02X\"", cmd);
+    }
+    UNREACHABLE_RETURN(Qundef);
 }
 
 
@@ -6032,7 +6102,7 @@ nogvl_mkfifo(void *ptr)
  */
 
 static VALUE
-rb_file_s_mkfifo(int argc, VALUE *argv)
+rb_file_s_mkfifo(int argc, VALUE *argv, VALUE _)
 {
     VALUE path;
     struct mkfifo_arg ma;
@@ -6088,7 +6158,7 @@ rb_is_absolute_path(const char *path)
 
 #if ENABLE_PATH_CHECK
 static int
-path_check_0(VALUE path, int execpath)
+path_check_0(VALUE path)
 {
     struct stat st;
     const char *p0 = StringValueCStr(path);
@@ -6116,12 +6186,12 @@ path_check_0(VALUE path, int execpath)
 #endif
 	if (STAT(p0, &st) == 0 && S_ISDIR(st.st_mode) && (st.st_mode & S_IWOTH)
 #ifdef S_ISVTX
-	    && !(p && execpath && (st.st_mode & S_ISVTX))
+	    && !(p && (st.st_mode & S_ISVTX))
 #endif
 	    && !access(p0, W_OK)) {
-	    rb_enc_warn(enc, "Insecure world writable dir %s in %sPATH, mode 0%"
+	    rb_enc_warn(enc, "Insecure world writable dir %s in PATH, mode 0%"
 			PRI_MODET_PREFIX"o",
-			p0, (execpath ? "" : "LOAD_"), st.st_mode);
+			p0, st.st_mode);
 	    if (p) *p = '/';
 	    RB_GC_GUARD(path);
 	    return 0;
@@ -6134,12 +6204,6 @@ path_check_0(VALUE path, int execpath)
 	*p = '\0';
     }
 }
-#endif
-
-#if ENABLE_PATH_CHECK
-#define fpath_check(path) path_check_0((path), FALSE)
-#else
-#define fpath_check(path) 1
 #endif
 
 int
@@ -6157,7 +6221,7 @@ rb_path_check(const char *path)
     if (!p) p = pend;
 
     for (;;) {
-	if (!path_check_0(rb_str_new(p0, p - p0), TRUE)) {
+	if (!path_check_0(rb_str_new(p0, p - p0))) {
 	    return 0;		/* not safe */
 	}
 	p0 = p + 1;
@@ -6238,13 +6302,14 @@ copy_path_class(VALUE path, VALUE orig)
 }
 
 int
-rb_find_file_ext(VALUE *filep, const char *const *ext)
+rb_find_file_ext_safe(VALUE *filep, const char *const *ext, int _level)
 {
-    return rb_find_file_ext_safe(filep, ext, rb_safe_level());
+    rb_warn("rb_find_file_ext_safe will be removed in Ruby 3.0");
+    return rb_find_file_ext(filep, ext);
 }
 
 int
-rb_find_file_ext_safe(VALUE *filep, const char *const *ext, int safe_level)
+rb_find_file_ext(VALUE *filep, const char *const *ext)
 {
     const char *f = StringValueCStr(*filep);
     VALUE fname = *filep, load_path, tmp;
@@ -6255,18 +6320,12 @@ rb_find_file_ext_safe(VALUE *filep, const char *const *ext, int safe_level)
 
     if (f[0] == '~') {
 	fname = file_expand_path_1(fname);
-	if (safe_level >= 1 && OBJ_TAINTED(fname)) {
-	    rb_raise(rb_eSecurityError, "loading from unsafe file %s", f);
-	}
 	f = RSTRING_PTR(fname);
 	*filep = fname;
 	expanded = 1;
     }
 
     if (expanded || rb_is_absolute_path(f) || is_explicit_relative(f)) {
-	if (safe_level >= 1 && !fpath_check(fname)) {
-	    rb_raise(rb_eSecurityError, "loading from unsafe path %s", f);
-	}
 	if (!expanded) fname = file_expand_path_1(fname);
 	fnlen = RSTRING_LEN(fname);
 	for (i=0; ext[i]; i++) {
@@ -6293,14 +6352,13 @@ rb_find_file_ext_safe(VALUE *filep, const char *const *ext, int safe_level)
 	for (i = 0; i < RARRAY_LEN(load_path); i++) {
 	    VALUE str = RARRAY_AREF(load_path, i);
 
-	    RB_GC_GUARD(str) = rb_get_path_check(str, safe_level);
+            RB_GC_GUARD(str) = rb_get_path(str);
 	    if (RSTRING_LEN(str) == 0) continue;
 	    rb_file_expand_path_internal(fname, str, 0, 0, tmp);
 	    if (rb_file_load_ok(RSTRING_PTR(tmp))) {
 		*filep = copy_path_class(tmp, *filep);
 		return (int)(j+1);
 	    }
-	    FL_UNSET(tmp, FL_TAINT);
 	}
 	rb_str_set_len(fname, fnlen);
     }
@@ -6310,13 +6368,14 @@ rb_find_file_ext_safe(VALUE *filep, const char *const *ext, int safe_level)
 }
 
 VALUE
-rb_find_file(VALUE path)
+rb_find_file_safe(VALUE path, int _level)
 {
-    return rb_find_file_safe(path, rb_safe_level());
+    rb_warn("rb_find_file_safe will be removed in Ruby 3.0");
+    return rb_find_file(path);
 }
 
 VALUE
-rb_find_file_safe(VALUE path, int safe_level)
+rb_find_file(VALUE path)
 {
     VALUE tmp, load_path;
     const char *f = StringValueCStr(path);
@@ -6324,18 +6383,12 @@ rb_find_file_safe(VALUE path, int safe_level)
 
     if (f[0] == '~') {
 	tmp = file_expand_path_1(path);
-	if (safe_level >= 1 && OBJ_TAINTED(tmp)) {
-	    rb_raise(rb_eSecurityError, "loading from unsafe file %"PRIsVALUE, tmp);
-	}
 	path = copy_path_class(tmp, path);
 	f = RSTRING_PTR(path);
 	expanded = 1;
     }
 
     if (expanded || rb_is_absolute_path(f) || is_explicit_relative(f)) {
-	if (safe_level >= 1 && !fpath_check(path)) {
-	    rb_raise(rb_eSecurityError, "loading from unsafe path %"PRIsVALUE, path);
-	}
 	if (!rb_file_load_ok(f)) return 0;
 	if (!expanded)
 	    path = copy_path_class(file_expand_path_1(path), path);
@@ -6350,7 +6403,7 @@ rb_find_file_safe(VALUE path, int safe_level)
 	rb_enc_associate_index(tmp, rb_usascii_encindex());
 	for (i = 0; i < RARRAY_LEN(load_path); i++) {
 	    VALUE str = RARRAY_AREF(load_path, i);
-	    RB_GC_GUARD(str) = rb_get_path_check(str, safe_level);
+            RB_GC_GUARD(str) = rb_get_path(str);
 	    if (RSTRING_LEN(str) > 0) {
 		rb_file_expand_path_internal(path, str, 0, 0, tmp);
 		f = RSTRING_PTR(tmp);
@@ -6365,10 +6418,6 @@ rb_find_file_safe(VALUE path, int safe_level)
     }
 
   found:
-    if (safe_level >= 1 && !fpath_check(tmp)) {
-	rb_raise(rb_eSecurityError, "loading from unsafe file %"PRIsVALUE, tmp);
-    }
-
     return copy_path_class(tmp, path);
 }
 
@@ -6490,8 +6539,9 @@ Init_File(void)
     rb_define_singleton_method(rb_cFile, "umask", rb_file_s_umask, -1);
     rb_define_singleton_method(rb_cFile, "truncate", rb_file_s_truncate, 2);
     rb_define_singleton_method(rb_cFile, "mkfifo", rb_file_s_mkfifo, -1);
-    rb_define_singleton_method(rb_cFile, "expand_path", rb_file_s_expand_path, -1);
-    rb_define_singleton_method(rb_cFile, "absolute_path", rb_file_s_absolute_path, -1);
+    rb_define_singleton_method(rb_cFile, "expand_path", s_expand_path, -1);
+    rb_define_singleton_method(rb_cFile, "absolute_path", s_absolute_path, -1);
+    rb_define_singleton_method(rb_cFile, "absolute_path?", s_absolute_path_p, 1);
     rb_define_singleton_method(rb_cFile, "realpath", rb_file_s_realpath, -1);
     rb_define_singleton_method(rb_cFile, "realdirpath", rb_file_s_realdirpath, -1);
     rb_define_singleton_method(rb_cFile, "basename", rb_file_s_basename, -1);

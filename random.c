@@ -9,40 +9,59 @@
 
 **********************************************************************/
 
-#include "internal.h"
+#include "ruby/internal/config.h"
 
+#include <errno.h>
 #include <limits.h>
-#ifdef HAVE_UNISTD_H
-#include <unistd.h>
-#endif
+#include <math.h>
+#include <float.h>
 #include <time.h>
+
+#ifdef HAVE_UNISTD_H
+# include <unistd.h>
+#endif
+
 #include <sys/types.h>
 #include <sys/stat.h>
+
 #ifdef HAVE_FCNTL_H
-#include <fcntl.h>
+# include <fcntl.h>
 #endif
-#include <math.h>
-#include <errno.h>
+
 #if defined(HAVE_SYS_TIME_H)
-#include <sys/time.h>
+# include <sys/time.h>
 #endif
 
 #ifdef HAVE_SYSCALL_H
-#include <syscall.h>
+# include <syscall.h>
 #elif defined HAVE_SYS_SYSCALL_H
-#include <sys/syscall.h>
+# include <sys/syscall.h>
 #endif
 
 #ifdef _WIN32
-#include <windows.h>
-#include <wincrypt.h>
+# include <winsock2.h>
+# include <windows.h>
+# include <wincrypt.h>
 #endif
-#include "ruby_atomic.h"
 
 #ifdef __OpenBSD__
 /* to define OpenBSD for version check */
-#include <sys/param.h>
+# include <sys/param.h>
 #endif
+
+#if defined HAVE_GETRANDOM
+# include <sys/random.h>
+#elif defined __linux__ && defined __NR_getrandom
+# include <linux/random.h>
+#endif
+
+#include "internal.h"
+#include "internal/array.h"
+#include "internal/compilers.h"
+#include "internal/numeric.h"
+#include "internal/random.h"
+#include "internal/sanitizers.h"
+#include "ruby_atomic.h"
 
 typedef int int_must_be_32bit_at_least[sizeof(int) * CHAR_BIT < 32 ? -1 : 1];
 
@@ -58,12 +77,22 @@ genrand_real(struct MT *mt)
     return int_pair_to_real_exclusive(a, b);
 }
 
+static const double dbl_reduce_scale = /* 2**(-DBL_MANT_DIG) */
+    (1.0
+     / (double)(DBL_MANT_DIG > 2*31 ? (1ul<<31) : 1.0)
+     / (double)(DBL_MANT_DIG > 1*31 ? (1ul<<31) : 1.0)
+     / (double)(1ul<<(DBL_MANT_DIG%31)));
+
 static double
 int_pair_to_real_exclusive(uint32_t a, uint32_t b)
 {
-    a >>= 5;
-    b >>= 6;
-    return(a*67108864.0+b)*(1.0/9007199254740992.0);
+    static const int a_shift = DBL_MANT_DIG < 64 ?
+        (64-DBL_MANT_DIG)/2 : 0;
+    static const int b_shift = DBL_MANT_DIG < 64 ?
+        (65-DBL_MANT_DIG)/2 : 0;
+    a >>= a_shift;
+    b >>= b_shift;
+    return (a*(double)(1ul<<(32-b_shift))+b)*dbl_reduce_scale;
 }
 
 /* generates a random number on [0,1] with 53-bit resolution*/
@@ -93,14 +122,14 @@ typedef struct {
 static rb_random_t default_rand;
 
 static VALUE rand_init(struct MT *mt, VALUE vseed);
-static VALUE random_seed(void);
+static VALUE random_seed(VALUE);
 
 static rb_random_t *
 rand_start(rb_random_t *r)
 {
     struct MT *mt = &r->mt;
     if (!genrand_initialized(mt)) {
-	r->seed = rand_init(mt, random_seed());
+        r->seed = rand_init(mt, random_seed(Qundef));
     }
     return r;
 }
@@ -131,13 +160,13 @@ static double
 int_pair_to_real_inclusive(uint32_t a, uint32_t b)
 {
     double r;
-    enum {dig = 53};
+    enum {dig = DBL_MANT_DIG};
     enum {dig_u = dig-32, dig_r64 = 64-dig, bmask = ~(~0u<<(dig_r64))};
 #if defined HAVE_UINT128_T
     const uint128_t m = ((uint128_t)1 << dig) | 1;
     uint128_t x = ((uint128_t)a << 32) | b;
     r = (double)(uint64_t)((x * m) >> 64);
-#elif defined HAVE_UINT64_T && !(defined _MSC_VER && _MSC_VER <= 1200)
+#elif defined HAVE_UINT64_T && !MSC_VERSION_BEFORE(1300)
     uint64_t x = ((uint64_t)a << dig_u) +
 	(((uint64_t)b + (a >> dig_u)) >> dig_r64);
     r = (double)x;
@@ -146,7 +175,7 @@ int_pair_to_real_inclusive(uint32_t a, uint32_t b)
     b = (b >> dig_r64) + (((a >> dig_u) + (b & bmask)) >> dig_r64);
     r = (double)a * (1 << dig_u) + b;
 #endif
-    return ldexp(r, -dig);
+    return r * dbl_reduce_scale;
 }
 
 VALUE rb_cRandom;
@@ -261,7 +290,7 @@ random_init(int argc, VALUE *argv, VALUE obj)
 
     if (rb_check_arity(argc, 0, 1) == 0) {
 	rb_check_frozen(obj);
-	vseed = random_seed();
+        vseed = random_seed(obj);
     }
     else {
 	vseed = argv[0];
@@ -311,7 +340,7 @@ fill_random_bytes_urandom(void *seed, size_t size)
 		return -1;
 	    }
 	    offset += (size_t)ret;
-	} while(offset < size);
+	} while (offset < size);
     }
     close(fd);
     return 0;
@@ -320,11 +349,7 @@ fill_random_bytes_urandom(void *seed, size_t size)
 # define fill_random_bytes_urandom(seed, size) -1
 #endif
 
-#if defined HAVE_GETRANDOM
-# include <sys/random.h>
-#elif defined __linux__ && defined __NR_getrandom
-# include <linux/random.h>
-
+#if ! defined HAVE_GETRANDOM && defined __linux__ && defined __NR_getrandom
 # ifndef GRND_NONBLOCK
 #   define GRND_NONBLOCK 0x0001	/* not defined in musl libc */
 # endif
@@ -389,6 +414,8 @@ fill_random_bytes_syscall(void *seed, size_t size, int unused)
 	old_prov = (HCRYPTPROV)ATOMIC_PTR_CAS(perm_prov, 0, prov);
 	if (LIKELY(!old_prov)) { /* no other threads acquired */
 	    if (prov != (HCRYPTPROV)INVALID_HANDLE_VALUE) {
+#undef RUBY_UNTYPED_DATA_WARNING
+#define RUBY_UNTYPED_DATA_WARNING 0
 		rb_gc_register_mark_object(Data_Wrap_Struct(0, 0, release_crypt, &perm_prov));
 	    }
 	}
@@ -421,7 +448,7 @@ fill_random_bytes_syscall(void *seed, size_t size, int need_secure)
 		return -1;
 	    }
 	    offset += (size_t)ret;
-	} while(offset < size);
+	} while (offset < size);
 	return 0;
     }
     return -1;
@@ -440,6 +467,7 @@ ruby_fill_random_bytes(void *seed, size_t size, int need_secure)
 
 #define fill_random_bytes ruby_fill_random_bytes
 
+/* cnt must be 4 or more */
 static void
 fill_random_seed(uint32_t *seed, size_t cnt)
 {
@@ -489,6 +517,10 @@ make_seed_value(uint32_t *ptr, size_t len)
     return seed;
 }
 
+#define with_random_seed(size, add) \
+    for (uint32_t seedbuf[(size)+(add)], loop = (fill_random_seed(seedbuf, (size)), 1); \
+         loop; explicit_bzero(seedbuf, (size)*sizeof(seedbuf[0])), loop = 0)
+
 /*
  * call-seq: Random.new_seed -> integer
  *
@@ -498,13 +530,12 @@ make_seed_value(uint32_t *ptr, size_t len)
  *   Random.new_seed  #=> 115032730400174366788466674494640623225
  */
 static VALUE
-random_seed(void)
+random_seed(VALUE _)
 {
     VALUE v;
-    uint32_t buf[DEFAULT_SEED_CNT+1];
-    fill_random_seed(buf, DEFAULT_SEED_CNT);
-    v = make_seed_value(buf, DEFAULT_SEED_CNT);
-    explicit_bzero(buf, DEFAULT_SEED_LEN);
+    with_random_seed(DEFAULT_SEED_CNT, 1) {
+        v = make_seed_value(seedbuf, DEFAULT_SEED_CNT);
+    }
     return v;
 }
 
@@ -691,7 +722,7 @@ rb_f_srand(int argc, VALUE *argv, VALUE obj)
     rb_random_t *r = &default_rand;
 
     if (rb_check_arity(argc, 0, 1) == 0) {
-	seed = random_seed();
+        seed = random_seed(obj);
     }
     else {
 	seed = rb_to_int(argv[0]);
@@ -1043,9 +1074,11 @@ random_s_bytes(VALUE obj, VALUE len)
 static VALUE
 range_values(VALUE vmax, VALUE *begp, VALUE *endp, int *exclp)
 {
-    VALUE end;
+    VALUE beg, end;
 
-    if (!rb_range_values(vmax, begp, &end, exclp)) return Qfalse;
+    if (!rb_range_values(vmax, &beg, &end, exclp)) return Qfalse;
+    if (begp) *begp = beg;
+    if (NIL_P(beg)) return Qnil;
     if (endp) *endp = end;
     if (NIL_P(end)) return Qnil;
     return rb_check_funcall_default(end, id_minus, 1, begp, Qfalse);
@@ -1137,8 +1170,8 @@ rand_range(VALUE obj, rb_random_t* rnd, VALUE range)
 	long max;
 	vmax = v;
 	v = Qnil;
+      fixnum:
 	if (FIXNUM_P(vmax)) {
-	  fixnum:
 	    if ((max = FIX2LONG(vmax) - excl) >= 0) {
 		unsigned long r = random_ulong_limited(obj, rnd, (unsigned long)max);
 		v = ULONG2NUM(r);
@@ -1411,33 +1444,33 @@ random_s_rand(int argc, VALUE *argv, VALUE obj)
 typedef struct {
     st_index_t hash;
     uint8_t sip[16];
-} seed_keys_t;
+} hash_salt_t;
 
 static union {
-    seed_keys_t key;
-    uint32_t u32[type_roomof(seed_keys_t, uint32_t)];
-} seed;
+    hash_salt_t key;
+    uint32_t u32[type_roomof(hash_salt_t, uint32_t)];
+} hash_salt;
 
 static void
-init_seed(struct MT *mt)
+init_hash_salt(struct MT *mt)
 {
     int i;
 
-    for (i = 0; i < numberof(seed.u32); ++i)
-	seed.u32[i] = genrand_int32(mt);
+    for (i = 0; i < numberof(hash_salt.u32); ++i)
+	hash_salt.u32[i] = genrand_int32(mt);
 }
 
 NO_SANITIZE("unsigned-integer-overflow", extern st_index_t rb_hash_start(st_index_t h));
 st_index_t
 rb_hash_start(st_index_t h)
 {
-    return st_hash_start(seed.key.hash + h);
+    return st_hash_start(hash_salt.key.hash + h);
 }
 
 st_index_t
 rb_memhash(const void *ptr, long len)
 {
-    sip_uint64_t h = sip_hash13(seed.key.sip, ptr, len);
+    sip_uint64_t h = sip_hash13(hash_salt.key.sip, ptr, len);
 #ifdef HAVE_UINT64_T
     return (st_index_t)h;
 #else
@@ -1450,32 +1483,23 @@ rb_memhash(const void *ptr, long len)
 void
 Init_RandomSeedCore(void)
 {
+    if (!fill_random_bytes(&hash_salt, sizeof(hash_salt), FALSE)) return;
+
     /*
+      If failed to fill siphash's salt with random data, expand less random
+      data with MT.
+
       Don't reuse this MT for Random::DEFAULT. Random::DEFAULT::seed shouldn't
       provide a hint that an attacker guess siphash's seed.
     */
     struct MT mt;
-    uint32_t initial_seed[DEFAULT_SEED_CNT];
 
-    fill_random_seed(initial_seed, DEFAULT_SEED_CNT);
-    init_by_array(&mt, initial_seed, DEFAULT_SEED_CNT);
+    with_random_seed(DEFAULT_SEED_CNT, 0) {
+        init_by_array(&mt, seedbuf, DEFAULT_SEED_CNT);
+    }
 
-    init_seed(&mt);
-
-    explicit_bzero(initial_seed, DEFAULT_SEED_LEN);
-}
-
-static VALUE
-init_randomseed(struct MT *mt)
-{
-    uint32_t initial[DEFAULT_SEED_CNT+1];
-    VALUE seed;
-
-    fill_random_seed(initial, DEFAULT_SEED_CNT);
-    init_by_array(mt, initial, DEFAULT_SEED_CNT);
-    seed = make_seed_value(initial, DEFAULT_SEED_CNT);
-    explicit_bzero(initial, DEFAULT_SEED_LEN);
-    return seed;
+    init_hash_salt(&mt);
+    explicit_bzero(&mt, sizeof(mt));
 }
 
 /* construct Random::DEFAULT bits */
@@ -1487,7 +1511,10 @@ Init_Random_default(VALUE klass)
     VALUE v = TypedData_Wrap_Struct(klass, &random_mt_type, r);
 
     rb_gc_register_mark_object(v);
-    r->seed = init_randomseed(mt);
+    with_random_seed(DEFAULT_SEED_CNT, 1) {
+        init_by_array(mt, seedbuf, DEFAULT_SEED_CNT);
+        r->seed = make_seed_value(seedbuf, DEFAULT_SEED_CNT);
+    }
 
     return v;
 }

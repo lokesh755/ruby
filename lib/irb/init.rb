@@ -21,7 +21,7 @@ module IRB # :nodoc:
     IRB.load_modules
 
     unless @CONF[:PROMPT][@CONF[:PROMPT_MODE]]
-      IRB.fail(UndefinedPromptMode, @CONF[:PROMPT_MODE])
+      fail UndefinedPromptMode, @CONF[:PROMPT_MODE]
     end
   end
 
@@ -43,7 +43,7 @@ module IRB # :nodoc:
     @CONF[:LOAD_MODULES] = []
     @CONF[:IRB_RC] = nil
 
-    @CONF[:USE_READLINE] = false unless defined?(ReadlineInputMethod)
+    @CONF[:USE_SINGLELINE] = false unless defined?(ReadlineInputMethod)
     @CONF[:USE_COLORIZE] = true
     @CONF[:INSPECT_MODE] = true
     @CONF[:USE_TRACER] = false
@@ -51,6 +51,7 @@ module IRB # :nodoc:
     @CONF[:IGNORE_SIGINT] = true
     @CONF[:IGNORE_EOF] = false
     @CONF[:ECHO] = nil
+    @CONF[:ECHO_ON_ASSIGNMENT] = nil
     @CONF[:VERBOSE] = nil
 
     @CONF[:EVAL_HISTORY] = nil
@@ -160,18 +161,22 @@ module IRB # :nodoc:
         end
       when "--noinspect"
         @CONF[:INSPECT_MODE] = false
-      when "--readline"
-        @CONF[:USE_READLINE] = true
-      when "--noreadline"
-        @CONF[:USE_READLINE] = false
-      when "--reidline"
-        @CONF[:USE_REIDLINE] = true
-      when "--noreidline"
-        @CONF[:USE_REIDLINE] = false
+      when "--singleline", "--readline", "--legacy"
+        @CONF[:USE_SINGLELINE] = true
+      when "--nosingleline", "--noreadline"
+        @CONF[:USE_SINGLELINE] = false
+      when "--multiline", "--reidline"
+        @CONF[:USE_MULTILINE] = true
+      when "--nomultiline", "--noreidline"
+        @CONF[:USE_MULTILINE] = false
       when "--echo"
         @CONF[:ECHO] = true
       when "--noecho"
         @CONF[:ECHO] = false
+      when "--echo-on-assignment"
+        @CONF[:ECHO_ON_ASSIGNMENT] = true
+      when "--noecho-on-assignment"
+        @CONF[:ECHO_ON_ASSIGNMENT] = false
       when "--verbose"
         @CONF[:VERBOSE] = true
       when "--noverbose"
@@ -212,7 +217,7 @@ module IRB # :nodoc:
         end
         break
       when /^-/
-        IRB.fail UnrecognizedSwitch, opt
+        fail UnrecognizedSwitch, opt
       else
         @CONF[:SCRIPT] = opt
         $0 = opt
@@ -257,7 +262,7 @@ module IRB # :nodoc:
     when String
       return rc_file
     else
-      IRB.fail IllegalRCNameGenerator
+      fail IllegalRCNameGenerator
     end
   end
 
@@ -266,14 +271,23 @@ module IRB # :nodoc:
     if irbrc = ENV["IRBRC"]
       yield proc{|rc| rc == "rc" ? irbrc : irbrc+rc}
     end
+    if xdg_config_home = ENV["XDG_CONFIG_HOME"]
+      irb_home = File.join(xdg_config_home, "irb")
+      unless File.exist? irb_home
+        require 'fileutils'
+        FileUtils.mkdir_p irb_home
+      end
+      yield proc{|rc| irb_home + "/irb#{rc}"}
+    end
     if home = ENV["HOME"]
       yield proc{|rc| home+"/.irb#{rc}"}
     end
-    home = Dir.pwd
-    yield proc{|rc| home+"/.irb#{rc}"}
-    yield proc{|rc| home+"/irb#{rc.sub(/\A_?/, '.')}"}
-    yield proc{|rc| home+"/_irb#{rc}"}
-    yield proc{|rc| home+"/$irb#{rc}"}
+    current_dir = Dir.pwd
+    yield proc{|rc| current_dir+"/.config/irb/irb#{rc}"}
+    yield proc{|rc| current_dir+"/.irb#{rc}"}
+    yield proc{|rc| current_dir+"/irb#{rc.sub(/\A_?/, '.')}"}
+    yield proc{|rc| current_dir+"/_irb#{rc}"}
+    yield proc{|rc| current_dir+"/$irb#{rc}"}
   end
 
   # loading modules
@@ -291,15 +305,18 @@ module IRB # :nodoc:
   DefaultEncodings = Struct.new(:external, :internal)
   class << IRB
     private
-    def set_encoding(extern, intern = nil)
+    def set_encoding(extern, intern = nil, override: true)
       verbose, $VERBOSE = $VERBOSE, nil
       Encoding.default_external = extern unless extern.nil? || extern.empty?
       Encoding.default_internal = intern unless intern.nil? || intern.empty?
-      @CONF[:ENCODINGS] = IRB::DefaultEncodings.new(extern, intern)
       [$stdin, $stdout, $stderr].each do |io|
         io.set_encoding(extern, intern)
       end
-      @CONF[:LC_MESSAGES].instance_variable_set(:@encoding, extern)
+      if override
+        @CONF[:LC_MESSAGES].instance_variable_set(:@override_encoding, extern)
+      else
+        @CONF[:LC_MESSAGES].instance_variable_set(:@encoding, extern)
+      end
     ensure
       $VERBOSE = verbose
     end
